@@ -1,0 +1,195 @@
+@import "tailwindcss";
+@import "katex/dist/katex.min.css";
+@import "highlight.js/styles/github-dark.min.css";
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+  }
+}
+
+/* Custom sleek scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.25);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.45);
+}
+
+/* Prose / Markdown styling for tutor responses and notes */
+.study-prose {
+  font-size: 0.9rem;
+  line-height: 1.65;
+  color: #e2e8f0;
+}
+.study-prose h1,
+.study-prose h2,
+.study-prose h3 {
+  font-weight: 700;
+  color: #f8fafc;
+  margin-top: 1em;
+  margin-bottom: 0.45em;
+}
+.study-prose h1 { font-size: 1.25rem; }
+.study-prose h2 { font-size: 1.08rem; }
+.study-prose h3 { font-size: 0.98rem; }
+.study-prose p {
+  margin-bottom: 0.65em;
+}
+.study-prose p:last-child {
+  margin-bottom: 0;
+}
+.study-prose ul,
+.study-prose ol {
+  padding-left: 1.35em;
+  margin-bottom: 0.7em;
+}
+.study-prose ul { list-style-type: disc; }
+.study-prose ol { list-style-type: decimal; }
+.study-prose li {
+  margin-bottom: 0.25em;
+}
+.study-prose blockquote {
+  border-left: 3px solid #6366f1;
+  background: rgba(99, 102, 241, 0.1);
+  padding: 0.55em 0.85em;
+  border-radius: 0 0.5rem 0.5rem 0;
+  margin: 0.7em 0;
+  color: #cbd5e1;
+}
+.study-prose code:not(pre code) {
+  background: rgba(148, 163, 184, 0.16);
+  color: #a5b4fc;
+  padding: 0.12em 0.35em;
+  border-radius: 0.3rem;
+  font-size: 0.84em;
+}
+.study-prose pre {
+  background: #0b1120;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 0.65rem;
+  padding: 0.8rem;
+  overflow-x: auto;
+  margin: 0.7rem 0;
+  font-size: 0.8rem;
+}
+.study-prose strong {
+  color: #f8fafc;
+}
+.study-prose .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.35rem 0;
+}
+
+/* Quiz text: inherit surrounding size/color, code blocks look like an editor */
+.quiz-prose {
+  font-size: inherit;
+  line-height: 1.6;
+  color: inherit;
+}
+.quiz-prose pre {
+  font-size: 12.5px;
+  line-height: 1.6;
+  tab-size: 4;
+  white-space: pre;
+}
+.quiz-prose pre code {
+  font-family: ui-monospace, SFMono-Regular, Consolas, 'Cascadia Code', monospace;
+  font-weight: 400;
+}
+
+.dot-grid {
+  background-color: #0b1120;
+  background-image: radial-gradient(rgba(148, 163, 184, 0.22) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/* Word (docx-preview): keep white pages, drop the grey wrapper so it fits the dark theme */
+.docx-host .docx-wrapper {
+  background: transparent !important;
+  padding: 0 0 24px !important;
+  width: max-content;
+  min-width: 100%;
+}
+.docx-host .docx-wrapper > section.docx {
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45) !important;
+  margin-bottom: 20px !important;
+}
+
+/* PowerPoint (pptx-preview) */
+.pptx-host {
+  max-width: 100%;
+}
+.pptx-host .pptx-preview-wrapper {
+  background: transparent !important;
+  height: auto !important;
+}
+
+/* Excel (SheetJS HTML table) */
+.sheet-host table {
+  border-collapse: collapse;
+  color: #e2e8f0;
+}
+.sheet-host td,
+.sheet-host th {
+  border: 1px solid rgba(51, 65, 85, 0.9);
+  padding: 4px 8px;
+  white-space: nowrap;
+}
+.sheet-host tr:first-child td {
+  background: rgba(30, 41, 59, 0.9);
+  font-weight: 600;
+}
+.sheet-host tr:nth-child(even) td {
+  background: rgba(15, 23, 42, 0.6);
+}
+
+/* Sayfa Senkron: dim everything except the explanation of the page shown in the viewer */
+.page-sync-on > * {
+  opacity: 0.28;
+  filter: saturate(0.45);
+  transition:
+    opacity 0.3s ease,
+    filter 0.3s ease;
+}
+.page-sync-on > .has-page-focus {
+  opacity: 1;
+  filter: none;
+}
+.page-sync-on > .has-page-focus .page-preamble,
+.page-sync-on > .has-page-focus .page-section {
+  opacity: 0.28;
+  filter: saturate(0.45);
+  transition:
+    opacity 0.3s ease,
+    filter 0.3s ease,
+    background-color 0.3s ease,
+    box-shadow 0.3s ease;
+}
+.page-sync-on > .has-page-focus .page-section.is-focused {
+  opacity: 1;
+  filter: none;
+  background-color: rgba(99, 102, 241, 0.1);
+  box-shadow:
+    inset 3px 0 0 #818cf8,
+    0 0 0 1px rgba(129, 140, 248, 0.25);
+}
+.page-section {
+  border-radius: 0.6rem;
+  margin: 0.15rem -0.5rem;
+  padding: 0.1rem 0.5rem 0.2rem 0.75rem;
+}
