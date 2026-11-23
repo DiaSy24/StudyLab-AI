@@ -7,8 +7,16 @@ import { agySessionPool } from '../server/services/agySessionPool.js';
 import { DesktopUpdater } from './updater.js';
 
 const HOST = '127.0.0.1';
-const PREFERRED_PORT = Number(process.env.STUDYLAB_PORT || 3456);
 const MAX_PORT_ATTEMPTS = 12;
+
+function getPreferredPort(): number {
+  if (process.env.STUDYLAB_PORT?.trim()) {
+    const parsed = Number(process.env.STUDYLAB_PORT);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  // Use a dedicated port in packaged builds so it never collides with `npm run dev` on 3456
+  return app.isPackaged ? 43456 : 3456;
+}
 
 interface WindowBounds {
   width: number;
@@ -110,19 +118,30 @@ async function startEmbeddedServer(
 
   const tryListen = (port: number): Promise<{ server: http.Server; port: number }> =>
     new Promise((resolve, reject) => {
-      const server = expressApp.listen(port, HOST, () => {
+      const server = http.createServer(expressApp);
+      const onError = (err: NodeJS.ErrnoException) => {
+        server.removeListener('listening', onListening);
+        try {
+          server.close();
+        } catch {
+          // ignore
+        }
+        reject(err);
+      };
+      const onListening = () => {
+        server.removeListener('error', onError);
         const addr = server.address();
         const actualPort = typeof addr === 'object' && addr ? addr.port : port;
         resolve({ server, port: actualPort });
-      });
-      server.once('error', (err: NodeJS.ErrnoException) => {
-        server.close();
-        reject(err);
-      });
+      };
+      server.once('error', onError);
+      server.once('listening', onListening);
+      server.listen({ port, host: HOST, exclusive: true });
     });
 
+  const preferredPort = getPreferredPort();
   for (let i = 0; i < MAX_PORT_ATTEMPTS; i++) {
-    const candidate = PREFERRED_PORT + i;
+    const candidate = preferredPort + i;
     try {
       return await tryListen(candidate);
     } catch (err) {
