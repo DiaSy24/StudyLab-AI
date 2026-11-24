@@ -2,6 +2,14 @@ import React, { useEffect, useState } from 'react';
 import { CheckCircle2, Download, Loader2, RefreshCw, Sparkles, X } from 'lucide-react';
 import type { DesktopUpdateStatus } from '../../types/desktop';
 
+function formatBytes(bytes?: number): string | null {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes <= 0) return null;
+  if (bytes < 1024 * 1024) {
+    return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 export const UpdateBanner: React.FC = () => {
   const [status, setStatus] = useState<DesktopUpdateStatus>({ state: 'idle' });
   const [dismissed, setDismissed] = useState(false);
@@ -9,12 +17,20 @@ export const UpdateBanner: React.FC = () => {
   useEffect(() => {
     const desktop = window.studyLabDesktop;
     if (!desktop) return;
-    const unsubscribe = desktop.onUpdateStatus((next) => {
+
+    let active = true;
+    const applyStatus = (next: DesktopUpdateStatus) => {
+      if (!active) return;
       if (next.state === 'error' && next.silent) {
         return;
       }
       setStatus(next);
-      if (next.state === 'available' || next.state === 'downloaded' || next.state === 'error') {
+      if (
+        next.state === 'available' ||
+        next.state === 'downloaded' ||
+        next.state === 'installing' ||
+        next.state === 'error'
+      ) {
         setDismissed(false);
       }
       if (next.state === 'not-available') {
@@ -23,8 +39,17 @@ export const UpdateBanner: React.FC = () => {
           setStatus((cur) => (cur.state === 'not-available' ? { state: 'idle' } : cur));
         }, 4000);
       }
-    });
-    return unsubscribe;
+    };
+
+    if (typeof desktop.getUpdateStatus === 'function') {
+      void desktop.getUpdateStatus().then(applyStatus).catch(() => {});
+    }
+
+    const unsubscribe = desktop.onUpdateStatus(applyStatus);
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, []);
 
   if (dismissed || status.state === 'idle' || status.state === 'checking') {
@@ -66,12 +91,16 @@ export const UpdateBanner: React.FC = () => {
 
   if (status.state === 'available' || status.state === 'downloading') {
     const percent = status.state === 'downloading' ? status.percent : 0;
+    const transferredLabel =
+      status.state === 'downloading' ? formatBytes(status.transferred) : null;
+    const totalLabel = status.state === 'downloading' ? formatBytes(status.total) : null;
     return (
       <div className="flex items-center justify-between gap-3 border-b border-indigo-500/30 bg-indigo-500/15 px-4 py-1.5 text-xs text-indigo-100">
         <div className="flex items-center gap-2">
           <Loader2 className="h-3.5 w-3.5 animate-spin text-indigo-300" />
           <span className="font-medium">
-            Yeni StudyLab AI sürümü {status.version ? `(v${status.version}) ` : ''}indiriliyor...
+            Yeni StudyLab AI sürümü {status.version ? `(v${status.version}) ` : ''}arka planda
+            indiriliyor...
           </span>
           {status.state === 'downloading' ? (
             <div className="flex items-center gap-2">
@@ -81,7 +110,12 @@ export const UpdateBanner: React.FC = () => {
                   style={{ width: `${percent}%` }}
                 />
               </div>
-              <span className="text-[11px] text-indigo-200">%{percent}</span>
+              <span className="text-[11px] text-indigo-200">
+                %{percent}
+                {totalLabel
+                  ? ` (${transferredLabel ? `${transferredLabel} / ` : ''}${totalLabel})`
+                  : ''}
+              </span>
             </div>
           ) : null}
         </div>
@@ -96,13 +130,30 @@ export const UpdateBanner: React.FC = () => {
     );
   }
 
+  if (status.state === 'installing') {
+    return (
+      <div className="flex items-center justify-between gap-3 border-b border-emerald-500/40 bg-emerald-500/15 px-4 py-2 text-xs text-emerald-100">
+        <div className="flex items-center gap-2">
+          <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-300" />
+          <span className="font-semibold">
+            Güncelleme {status.version ? `(v${status.version}) ` : ''}arka planda uygulanıyor,
+            StudyLab AI otomatik yeniden başlatılacak...
+          </span>
+        </div>
+      </div>
+    );
+  }
+
   // status.state === 'downloaded'
+  const downloadedSizeLabel = formatBytes(status.downloadedBytes);
   return (
     <div className="flex items-center justify-between gap-3 border-b border-emerald-500/40 bg-gradient-to-r from-indigo-600/25 via-emerald-600/20 to-cyan-600/20 px-4 py-2 text-xs text-white">
       <div className="flex items-center gap-2">
         <Sparkles className="h-4 w-4 text-emerald-300" />
         <span className="font-semibold">
-          StudyLab AI v{status.version} indirildi ve kuruluma hazır!
+          StudyLab AI v{status.version} arka planda hazır
+          {downloadedSizeLabel ? ` (${downloadedSizeLabel})` : ''} — uygulamayı kapattığınızda
+          sessizce kurulacak.
         </span>
       </div>
       <div className="flex items-center gap-2">
@@ -112,12 +163,12 @@ export const UpdateBanner: React.FC = () => {
           className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3 py-1 text-[11px] font-semibold text-slate-950 shadow transition hover:bg-emerald-400"
         >
           <RefreshCw className="h-3 w-3" />
-          Yeniden Başlat ve Güncelle
+          Şimdi Güncelle ve Yeniden Başlat
         </button>
         <button
           type="button"
           onClick={() => setDismissed(true)}
-          title="Sonra (uygulama kapanınca otomatik kurulur)"
+          title="Sonra (uygulama kapanınca kurulum ekranı olmadan otomatik kurulur)"
           className="rounded p-1 text-slate-300 hover:bg-white/10 hover:text-white"
         >
           <X className="h-3.5 w-3.5" />

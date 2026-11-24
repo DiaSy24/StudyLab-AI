@@ -11,25 +11,24 @@ asar: true
 files:
   - dist-electron/**/*
   - package.json
-  - node_modules/**/*
-  - "!node_modules/three/**/*"
-  - "!node_modules/pdfjs-dist/**/*"
-  - "!node_modules/katex/**/*"
-  - "!node_modules/pptx-preview/**/*"
-  - "!node_modules/docx-preview/**/*"
-  - "!node_modules/highlight.js/**/*"
-  - "!node_modules/lucide-react/**/*"
-  - "!node_modules/react/**/*"
-  - "!node_modules/react-dom/**/*"
-  - "!node_modules/xlsx/**/*"
-  - "!node_modules/mammoth/**/*"
-  - "!node_modules/jszip/**/*"
-  - "!node_modules/marked/**/*"
-  - "!node_modules/express/**/*"
-  - "!node_modules/multer/**/*"
-  - "!node_modules/zod/**/*"
-  - "!node_modules/cors/**/*"
-  - "!node_modules/uuid/**/*"
+  - "!node_modules/**/*"
+  - node_modules/electron-updater/**/*
+  - node_modules/builder-util-runtime/**/*
+  - node_modules/fs-extra/**/*
+  - node_modules/graceful-fs/**/*
+  - node_modules/jsonfile/**/*
+  - node_modules/universalify/**/*
+  - node_modules/js-yaml/**/*
+  - node_modules/argparse/**/*
+  - node_modules/sprintf-js/**/*
+  - node_modules/lazy-val/**/*
+  - node_modules/lodash.escaperegexp/**/*
+  - node_modules/lodash.isequal/**/*
+  - node_modules/semver/**/*
+  - node_modules/tiny-typed-emitter/**/*
+  - node_modules/debug/**/*
+  - node_modules/ms/**/*
+  - node_modules/sax/**/*
 
 extraResources:
   - from: dist
@@ -55,6 +54,7 @@ nsis:
   createStartMenuShortcut: true
   shortcutName: StudyLab AI
   runAfterFinish: true
+  differentialPackage: store-asar
 
 # GitHub Releases otomatik güncelleme kaynağı (electron-updater).
 # Yeni sürüm yayınlamak için package.json version değerini artırıp `npm run release:win` çalıştırın.

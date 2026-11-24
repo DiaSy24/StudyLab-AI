@@ -154,6 +154,22 @@ async function startEmbeddedServer(
   return tryListen(0);
 }
 
+function cleanupBeforeExit(): void {
+  if (isQuitting) return;
+  isQuitting = true;
+  updater.dispose();
+  agySessionPool.disposeAll();
+  if (httpServer) {
+    try {
+      httpServer.closeAllConnections?.();
+      httpServer.close();
+    } catch {
+      // ignore
+    }
+    httpServer = null;
+  }
+}
+
 function registerIpcHandlers(): void {
   ipcMain.handle('studylab:get-app-info', () => ({
     isDesktop: true as const,
@@ -163,11 +179,11 @@ function registerIpcHandlers(): void {
     isPackaged: app.isPackaged,
   }));
 
+  ipcMain.handle('studylab:get-update-status', () => updater.getLastStatus());
   ipcMain.handle('studylab:check-updates', () => updater.checkForUpdates(true));
   ipcMain.handle('studylab:download-update', () => updater.downloadUpdate());
   ipcMain.handle('studylab:install-update', () => {
-    isQuitting = true;
-    agySessionPool.disposeAll();
+    cleanupBeforeExit();
     updater.installUpdate();
   });
   ipcMain.handle('studylab:open-data-folder', async () => {
@@ -335,6 +351,7 @@ if (!gotLock) {
 
       await createMainWindow(startUrl);
       updater.scheduleStartupCheck(5000);
+      updater.startPeriodicChecks();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       dialog.showErrorBox('StudyLab AI Başlatılamadı', `Uygulama başlatılırken bir hata oluştu:\n\n${msg}`);
@@ -349,16 +366,6 @@ if (!gotLock) {
   });
 
   app.on('before-quit', () => {
-    if (isQuitting) return;
-    isQuitting = true;
-    agySessionPool.disposeAll();
-    if (httpServer) {
-      try {
-        httpServer.close();
-      } catch {
-        // ignore
-      }
-      httpServer = null;
-    }
+    cleanupBeforeExit();
   });
 }

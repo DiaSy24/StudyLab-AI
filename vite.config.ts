@@ -69,5 +69,34 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     sourcemap: false,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return undefined;
+          if (/[\\/]node_modules[\\/](react|react-dom|scheduler)[\\/]/.test(id)) {
+            return 'vendor-react';
+          }
+          if (/[\\/]node_modules[\\/]lucide-react[\\/]/.test(id)) {
+            return 'vendor-icons';
+          }
+          if (/[\\/]node_modules[\\/]highlight\.js[\\/]/.test(id)) {
+            return 'vendor-highlight';
+          }
+          if (/[\\/]node_modules[\\/]katex[\\/]/.test(id)) {
+            return 'vendor-katex';
+          }
+          if (/[\\/]node_modules[\\/]marked[\\/]/.test(id)) {
+            return 'vendor-markdown';
+          }
+          if (/[\\/]node_modules[\\/]pdfjs-dist[\\/]/.test(id)) {
+            return 'vendor-pdf';
+          }
+          if (/[\\/]node_modules[\\/](mammoth|jszip|docx-preview|pptx-preview|xlsx)[\\/]/.test(id)) {
+            return 'vendor-docs';
+          }
+          return undefined;
+        },
+      },
+    },
   },
 });

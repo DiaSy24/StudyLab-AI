@@ -76,6 +76,38 @@ function main() {
       GH_TOKEN: token,
     },
   });
+
+  verifyReleaseArtifacts(version);
+}
+
+function verifyReleaseArtifacts(version) {
+  const releaseDir = path.join(PROJECT_ROOT, 'release');
+  const expectedFiles = [
+    `StudyLab-AI-Setup-${version}.exe`,
+    `StudyLab-AI-Setup-${version}.exe.blockmap`,
+    'latest.yml',
+  ];
+
+  const missing = [];
+  console.log('\n📦 Release çıktı doğrulaması (delta güncelleme dosyaları):');
+  for (const name of expectedFiles) {
+    const fullPath = path.join(releaseDir, name);
+    if (!fs.existsSync(fullPath)) {
+      missing.push(name);
+      continue;
+    }
+    const bytes = fs.statSync(fullPath).size;
+    const sizeLabel =
+      bytes >= 1024 * 1024
+        ? `${(bytes / (1024 * 1024)).toFixed(2)} MB`
+        : `${(bytes / 1024).toFixed(1)} KB`;
+    console.log(`   ✅ ${name} (${sizeLabel})`);
+  }
+
+  if (missing.length > 0) {
+    console.error(`❌ Eksik release dosyaları: ${missing.join(', ')}`);
+    process.exit(1);
+  }
 }
 
 main();

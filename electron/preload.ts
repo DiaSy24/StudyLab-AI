@@ -6,6 +6,8 @@ const UPDATE_CHANNEL = 'studylab:update-status';
 const desktopApi: StudyLabDesktopApi = {
   isDesktop: true,
   getAppInfo: () => ipcRenderer.invoke('studylab:get-app-info') as Promise<DesktopAppInfo>,
+  getUpdateStatus: () =>
+    ipcRenderer.invoke('studylab:get-update-status') as Promise<DesktopUpdateStatus>,
   checkForUpdates: () =>
     ipcRenderer.invoke('studylab:check-updates') as Promise<{ ok: boolean; reason?: string }>,
   downloadUpdate: () =>
