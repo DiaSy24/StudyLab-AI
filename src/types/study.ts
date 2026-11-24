@@ -200,6 +200,10 @@ export interface ChatMessage {
   createdAt: string;
   studyMode?: StudyMode;
   attachedResourceIds?: string[];
+  /** Resource ID (or `<folderId>::<innerPath>`) viewed/targeted when this message was created. */
+  sourceResourceId?: string;
+  /** Path or name of the viewed/targeted resource when this message was created. */
+  sourcePath?: string;
   annotation?: AnnotationAttachment;
   artifactIds?: string[];
   boardActionsApplied?: number;

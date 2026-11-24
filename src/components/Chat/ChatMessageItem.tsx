@@ -1,8 +1,14 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Bot, Box, HelpCircle, Layers, Sigma, User } from 'lucide-react';
+import { Bot, Box, FileText, HelpCircle, Layers, Sigma, User } from 'lucide-react';
 import { renderStudyMarkdown } from '../../lib/markdown';
 import { splitPageSections } from '../../lib/pageSections';
+import { fileNameOf } from '../../lib/resourceNavigation';
 import type { ChatMessage, StudyArtifact } from '../../types/study';
+
+export interface SourceBadgeInfo {
+  id: string;
+  label: string;
+}
 
 export function useElapsedSeconds(active: boolean): number {
   const [elapsed, setElapsed] = useState(0);
@@ -23,11 +29,28 @@ export function useElapsedSeconds(active: boolean): number {
 
 /**
  * Renders tutor markdown. Page-by-page answers (`## Sayfa N` headings) are split into
- * `.page-section` blocks carrying `data-page-from` / `data-page-to`, so the chat panel can
- * focus them and sync them with the resource viewer.
+ * `.page-section` blocks carrying `data-page-from` / `data-page-to` and matched resource
+ * metadata (`data-resource-id` / `data-resource-label`) so the chat panel can focus them
+ * and open the corresponding source + page in the viewer.
  */
-export const StudyMarkdownBody: React.FC<{ markdown: string; className?: string }> = React.memo(
-  ({ markdown, className = 'study-prose text-xs' }) => {
+export const StudyMarkdownBody: React.FC<{
+  markdown: string;
+  className?: string;
+  defaultSource?: SourceBadgeInfo | null;
+  onResolveSource?: (hint: string) => SourceBadgeInfo | null;
+  onOpenSourcePage?: (
+    resourceId: string | null,
+    page: number,
+    sectionEl?: HTMLElement | null,
+  ) => void;
+}> = React.memo(
+  ({
+    markdown,
+    className = 'study-prose text-xs',
+    defaultSource = null,
+    onResolveSource,
+    onOpenSourcePage,
+  }) => {
     const parts = useMemo(() => {
       const { preamble, sections } = splitPageSections(markdown);
       if (sections.length === 0) return null;
@@ -36,6 +59,7 @@ export const StudyMarkdownBody: React.FC<{ markdown: string; className?: string 
         sections: sections.map((sec) => ({
           from: sec.from,
           to: sec.to,
+          source: sec.source,
           html: renderStudyMarkdown(sec.markdown),
         })),
       };
@@ -52,15 +76,49 @@ export const StudyMarkdownBody: React.FC<{ markdown: string; className?: string 
         {parts.preambleHtml && (
           <div className="page-preamble" dangerouslySetInnerHTML={{ __html: parts.preambleHtml }} />
         )}
-        {parts.sections.map((sec, idx) => (
-          <div
-            key={`${sec.from}-${sec.to}-${idx}`}
-            className="page-section"
-            data-page-from={sec.from}
-            data-page-to={sec.to}
-            dangerouslySetInnerHTML={{ __html: sec.html }}
-          />
-        ))}
+        {parts.sections.map((sec, idx) => {
+          const resolved =
+            (sec.source && onResolveSource ? onResolveSource(sec.source) : null) ||
+            defaultSource ||
+            null;
+          const displayLabel =
+            resolved?.label || (sec.source ? fileNameOf(sec.source.replace(/\\/g, '/')) : '');
+          const canJump = Boolean(onOpenSourcePage && (resolved?.id || defaultSource));
+
+          return (
+            <div
+              key={`${sec.from}-${sec.to}-${idx}`}
+              className="page-section"
+              data-page-from={sec.from}
+              data-page-to={sec.to}
+              data-resource-id={resolved?.id || ''}
+              data-resource-label={displayLabel}
+            >
+              {displayLabel &&
+                (canJump ? (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      const secEl = e.currentTarget.closest<HTMLElement>('.page-section');
+                      onOpenSourcePage?.(resolved?.id || null, sec.from, secEl);
+                    }}
+                    title={`${displayLabel} • ${sec.from}. sayfayı aç`}
+                    className="page-section-source"
+                  >
+                    <FileText className="h-2.5 w-2.5 shrink-0" />
+                    <span className="truncate">{displayLabel}</span>
+                  </button>
+                ) : (
+                  <span className="page-section-source cursor-default" title={displayLabel}>
+                    <FileText className="h-2.5 w-2.5 shrink-0" />
+                    <span className="truncate">{displayLabel}</span>
+                  </span>
+                ))}
+              <div dangerouslySetInnerHTML={{ __html: sec.html }} />
+            </div>
+          );
+        })}
       </div>
     );
   },
@@ -72,17 +130,35 @@ interface ChatMessageItemProps {
   message: ChatMessage;
   linkedArtifacts: StudyArtifact[];
   variant: 'main' | 'quick';
+  defaultSource?: SourceBadgeInfo | null;
+  onResolveSource?: (hint: string) => SourceBadgeInfo | null;
+  onOpenSourcePage?: (
+    resourceId: string | null,
+    page: number,
+    sectionEl?: HTMLElement | null,
+  ) => void;
   onOpenArtifact: (artifact: StudyArtifact) => void;
 }
 
 export const ChatMessageItem: React.FC<ChatMessageItemProps> = React.memo(
-  ({ message, linkedArtifacts, variant, onOpenArtifact }) => {
+  ({
+    message,
+    linkedArtifacts,
+    variant,
+    defaultSource,
+    onResolveSource,
+    onOpenSourcePage,
+    onOpenArtifact,
+  }) => {
     const isUser = message.role === 'user';
     const isQuick = variant === 'quick';
 
 
     return (
-      <div className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
+      <div
+        data-message-role={message.role}
+        className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}
+      >
         <div className="mb-1 flex items-center gap-1.5 text-[10px] text-slate-500">
           {isUser ? (
             <>
@@ -132,7 +208,12 @@ export const ChatMessageItem: React.FC<ChatMessageItemProps> = React.memo(
           {isUser ? (
             <p className="whitespace-pre-wrap text-xs leading-relaxed">{message.content}</p>
           ) : (
-            <StudyMarkdownBody markdown={message.displayContent || message.content} />
+            <StudyMarkdownBody
+              markdown={message.displayContent || message.content}
+              defaultSource={defaultSource}
+              onResolveSource={onResolveSource}
+              onOpenSourcePage={onOpenSourcePage}
+            />
           )}
 
           {linkedArtifacts.length > 0 && (

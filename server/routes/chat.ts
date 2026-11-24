@@ -53,6 +53,7 @@ const chatRequestSchema = z.object({
     .enum(['check-step', 'hint', 'visualize-board', 'fix-artifact'])
     .optional(),
   artifactError: z.string().optional(),
+  viewingResourceId: z.string().max(1024).optional(),
   viewingPath: z.string().max(4096).optional(),
   viewingPage: z.number().int().positive().max(100000).optional(),
   viewingPageCount: z.number().int().positive().max(100000).optional(),
@@ -273,6 +274,8 @@ export function createChatRouter(store: WorkspaceStore): Router {
       createdAt: new Date().toISOString(),
       studyMode,
       attachedResourceIds: payload.selectedResourceIds,
+      sourceResourceId: payload.viewingResourceId,
+      sourcePath: payload.viewingPath,
       annotation: payload.annotation,
     };
     const [appendResult, allResources] = await Promise.all([
@@ -437,6 +440,8 @@ export function createChatRouter(store: WorkspaceStore): Router {
           displayContent: parsedResp.displayContent || agyResult.response,
           createdAt: new Date().toISOString(),
           studyMode,
+          sourceResourceId: payload.viewingResourceId,
+          sourcePath: payload.viewingPath,
           artifactIds: newArtifacts.map((a) => a.id),
           boardActionsApplied: parsedResp.boardActions.length,
           durationSeconds: agyResult.durationSeconds,
@@ -486,6 +491,8 @@ export function createChatRouter(store: WorkspaceStore): Router {
             displayContent: `${parsedPartial.displayContent || partialText}${noteSuffix}`,
             createdAt: new Date().toISOString(),
             studyMode,
+            sourceResourceId: payload.viewingResourceId,
+            sourcePath: payload.viewingPath,
           };
           const { session: finalSession, sessions: finalSessions } = await store.appendMessage(
             workspaceId,

@@ -214,7 +214,20 @@ describe('agyBridge', () => {
       expect(synced).toContain('4/20. sayfasını');
       expect(synced).toContain('SAYFA SENKRON MODU AÇIK');
       expect(synced).toContain('4. sayfadan başla');
+      expect(synced).toContain('<!-- kaynak: resources/ders.pdf -->');
       expect(synced).toContain('## Sayfa N');
+
+      const noViewerOpen = await buildStudyPrompt(tmpDir, {
+        workspace: ws,
+        userMessage: 'Hafta2.pdf kaynağını anlat',
+        studyMode: 'visual',
+        selectedResources: [],
+        pageByPage: true,
+        isFollowUp: true,
+        changedContext: {},
+      });
+      expect(noViewerOpen).toContain('SAYFA SENKRON MODU AÇIK');
+      expect(noViewerOpen).toContain('<!-- kaynak: DOSYA_YOLU -->');
 
       const asked = await buildStudyPrompt(tmpDir, {
         workspace: ws,

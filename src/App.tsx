@@ -23,9 +23,14 @@ import { WorkspaceSidebar } from './components/Sidebar/WorkspaceSidebar';
 import { ArtifactSandbox, type SandboxHandle } from './components/Stage/ArtifactSandbox';
 import { FormulaLabView } from './components/Stage/FormulaLabView';
 import { QuizStudio } from './components/Stage/QuizStudio';
-import { ResourceViewer, type ResourceViewerHandle } from './components/Stage/ResourceViewer';
+import {
+  ResourceViewer,
+  type RequestedViewerJump,
+  type ResourceViewerHandle,
+} from './components/Stage/ResourceViewer';
 import { api } from './lib/api';
 import { folderFileResource } from './lib/fileKinds';
+import { isPagedResource, matchStudyResource } from './lib/pageSections';
 import {
   fileNameOf,
   getNavigableWorkspaceResources,
@@ -198,6 +203,9 @@ export default function App() {
   const [viewerPage, setViewerPage] = useState<{ resourceId: string; page: number; count: number } | null>(
     null,
   );
+  const [requestedJump, setRequestedJump] = useState<RequestedViewerJump | null>(null);
+  const jumpSeqRef = useRef(0);
+  const loadedFolderIdsRef = useRef<Set<string>>(new Set());
 
   const sandboxRef = useRef<SandboxHandle>(null);
   const resourceViewerRef = useRef<ResourceViewerHandle>(null);
@@ -497,7 +505,9 @@ export default function App() {
       const detail = await api.getWorkspaceDetail(workspaceId);
       setActiveWorkspace(detail.workspace);
       setResources(detail.resources);
+      loadedFolderIdsRef.current.clear();
       setFolderTrees({});
+      setRequestedJump(null);
       setArtifacts(detail.artifacts);
       setSessions(detail.sessions || []);
       setActiveSessionId(detail.activeSessionId || null);
@@ -674,29 +684,64 @@ export default function App() {
     resourceViewerRef.current?.goToPage(page);
   }, []);
 
+  const handleRequestResourcePage = useCallback(
+    (resourceId: string | null, page: number) => {
+      if (!Number.isFinite(page) || page < 1) return;
+      const target = resourceId
+        ? matchStudyResource(resourceId, resources, folderTrees)?.resource ?? null
+        : displayedResource && displayedResource.category !== 'folder'
+          ? displayedResource
+          : null;
+      if (!target) return;
+
+      if (target.folderId && target.innerPath) {
+        const fId = target.folderId;
+        const inner = target.innerPath;
+        setFolderSelections((prev) => (prev[fId] === inner ? prev : { ...prev, [fId]: inner }));
+        setActiveResourceId(fId);
+      } else {
+        setActiveResourceId(target.id);
+      }
+      setActiveTab('resource');
+      setAnnotating(false);
+      setRequestedJump({
+        resourceId: target.id,
+        page: Math.max(1, Math.floor(page)),
+        seq: ++jumpSeqRef.current,
+      });
+    },
+    [resources, folderTrees, displayedResource],
+  );
+
   const handleFolderTreeLoaded = useCallback((folderId: string, entries: LinkedTreeEntry[]) => {
+    loadedFolderIdsRef.current.add(folderId);
     setFolderTrees((prev) => ({ ...prev, [folderId]: entries }));
   }, []);
 
-  // Ensure the active linked folder's tree is loaded even when the left sidebar or folder is collapsed
+  // Preload linked folder trees so sibling navigation and Sayfa Senkron source matching work even when collapsed
   useEffect(() => {
-    if (!activeResource || activeResource.category !== 'folder' || !activeFolderPath) return;
-    if (folderTrees[activeResource.id]) return;
+    const missing = resources.filter(
+      (r) => r.category === 'folder' && !folderTrees[r.id] && !loadedFolderIdsRef.current.has(r.id),
+    );
+    if (missing.length === 0) return;
     let cancelled = false;
-    void api
-      .getLinkedTree(activeResource)
-      .then((res) => {
-        if (!cancelled) {
-          setFolderTrees((prev) => ({ ...prev, [activeResource.id]: res.entries }));
-        }
-      })
-      .catch(() => {
-        // ignore; SidebarFolderTree shows errors if expanded
-      });
+    for (const folder of missing) {
+      loadedFolderIdsRef.current.add(folder.id);
+      void api
+        .getLinkedTree(folder)
+        .then((res) => {
+          if (!cancelled) {
+            setFolderTrees((prev) => ({ ...prev, [folder.id]: res.entries }));
+          }
+        })
+        .catch(() => {
+          // ignore; SidebarFolderTree shows errors if expanded
+        });
+    }
     return () => {
       cancelled = true;
     };
-  }, [activeResource, activeFolderPath, folderTrees]);
+  }, [resources, folderTrees]);
 
   // Sibling navigation for non-PDF resources:
   // - Inside a linked folder: files in the same directory (any extension)
@@ -816,6 +861,7 @@ export default function App() {
   const handleDeleteResource = async (resourceId: string) => {
     if (!activeWorkspace) return;
     await api.deleteResource(activeWorkspace.id, resourceId);
+    loadedFolderIdsRef.current.delete(resourceId);
     setResources((prev) => prev.filter((r) => r.id !== resourceId));
     setFolderTrees((prev) => {
       if (!(resourceId in prev)) return prev;
@@ -886,6 +932,11 @@ export default function App() {
         );
       }
 
+      const hasViewedResource =
+        Boolean(displayedResource && displayedResource.category !== 'folder') &&
+        (activeTab === 'resource' ||
+          Boolean(pageByPage && displayedResource && (currentViewerPage || isPagedResource(displayedResource))));
+
       await api.streamChat(
         activeWorkspace.id,
         {
@@ -898,15 +949,16 @@ export default function App() {
           annotation: opts?.annotation,
           coStudyAction: opts?.coStudyAction,
           artifactError: opts?.artifactError,
+          viewingResourceId: hasViewedResource && displayedResource ? displayedResource.id : undefined,
           viewingPath:
-            (activeTab === 'resource' || (pageByPage && currentViewerPage)) && displayedResource
+            hasViewedResource && displayedResource
               ? displayedResource.localPath || displayedResource.relativePath
               : undefined,
           viewingPage:
-            (activeTab === 'resource' || pageByPage) && currentViewerPage ? currentViewerPage.page : undefined,
+            hasViewedResource && currentViewerPage ? currentViewerPage.page : undefined,
           viewingPageCount:
-            (activeTab === 'resource' || pageByPage) && currentViewerPage ? currentViewerPage.count : undefined,
-          pageByPage: pageByPage && Boolean(currentViewerPage) ? true : undefined,
+            hasViewedResource && currentViewerPage ? currentViewerPage.count : undefined,
+          pageByPage: pageByPage ? true : undefined,
         },
         {
           onUserMessage: (msg, updatedSessions) => {
@@ -1611,6 +1663,7 @@ export default function App() {
                 resource={displayedResource!}
                 siblingNav={siblingNav}
                 isActive={activeTab === 'resource' && !annotating}
+                requestedJump={requestedJump}
                 onStartAnnotate={() => void handleStartAnnotate()}
                 onPageChange={handleViewerPageChange}
               />
@@ -1737,6 +1790,10 @@ export default function App() {
             activeTurnSessionIds={activeTurnSessionIds}
             messages={messages}
             artifacts={artifacts}
+            resources={resources}
+            folderTrees={folderTrees}
+            displayedResource={displayedResource}
+            isResourceTabActive={activeTab === 'resource'}
             streamingText={streamingText}
             statusText={statusText}
             isBusy={isBusy}
@@ -1744,8 +1801,10 @@ export default function App() {
             onSendMessage={(msg, opts) => sendTutorTurn(msg, { pageByPageOverride: opts?.pageByPage })}
             pageSync={pageSync}
             pageSyncAvailable={pageSyncAvailable}
-            activePage={pageSync ? currentViewerPage?.page ?? null : null}
+            activePage={pageSync && activeTab === 'resource' ? currentViewerPage?.page ?? null : null}
+            activeResourceId={activeTab === 'resource' ? displayedResource?.id ?? null : null}
             onRequestPage={handleRequestViewerPage}
+            onRequestResourcePage={handleRequestResourcePage}
             onTogglePageSync={(next) => {
               setPageSync(next);
             }}

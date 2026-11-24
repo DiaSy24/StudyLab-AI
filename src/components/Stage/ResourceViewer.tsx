@@ -24,6 +24,12 @@ export interface ResourceViewerHandle {
   goToPage: (page: number) => void;
 }
 
+export interface RequestedViewerJump {
+  resourceId: string;
+  page: number;
+  seq: number;
+}
+
 /** Page-like elements rendered by docx-preview (Word pages) and pptx-preview (slides). */
 const PAGED_DOC_SELECTOR = 'section.docx, .pptx-preview-slide-wrapper';
 
@@ -32,6 +38,8 @@ interface ResourceViewerProps {
   siblingNav?: SiblingNavigation;
   /** Whether the viewer tab is actively visible (guards keyboard arrow shortcuts). */
   isActive?: boolean;
+  /** Declarative page jump request (handles async resource switches and hidden-to-visible tab transitions). */
+  requestedJump?: RequestedViewerJump | null;
   onStartAnnotate: () => void;
   /** Reports the visible page and page count. `pageCount` is 0 when the resource has no pages. */
   onPageChange?: (page: number, pageCount: number) => void;
@@ -86,12 +94,16 @@ function saveViewerState(resourceId: string, state: StoredViewerState): void {
 }
 
 export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerProps>(
-  ({ resource, siblingNav, isActive = true, onStartAnnotate, onPageChange }, ref) => {
+  ({ resource, siblingNav, isActive = true, requestedJump = null, onStartAnnotate, onPageChange }, ref) => {
     const pdfCanvasRef = useRef<HTMLCanvasElement>(null);
     const imgRef = useRef<HTMLImageElement>(null);
     const scrollContainerRef = useRef<HTMLDivElement>(null);
     const pendingScrollTopRef = useRef<number | null>(null);
     const loadedResourceIdRef = useRef<string | null>(null);
+    const requestedJumpRef = useRef(requestedJump);
+    requestedJumpRef.current = requestedJump;
+    const lastHandledJumpSeqRef = useRef<number>(-1);
+    const pendingDocPageRef = useRef<number | null>(null);
 
     const initialState = loadViewerState(resource.id);
     const [pdfDoc, setPdfDoc] = useState<pdfjsLib.PDFDocumentProxy | null>(null);
@@ -130,13 +142,25 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
     useEffect(() => {
       let cancelled = false;
       const saved = loadViewerState(resource.id);
+      const jump =
+        requestedJumpRef.current &&
+        requestedJumpRef.current.resourceId === resource.id &&
+        requestedJumpRef.current.seq !== lastHandledJumpSeqRef.current
+          ? requestedJumpRef.current
+          : null;
+      if (jump) {
+        lastHandledJumpSeqRef.current = jump.seq;
+      }
+      const initialPage = jump ? Math.max(1, Math.floor(jump.page)) : saved.pageNum;
       loadedResourceIdRef.current = null;
-      pendingScrollTopRef.current = saved.scrollTop;
+      pendingScrollTopRef.current = jump ? (resource.category === 'pdf' ? 0 : null) : saved.scrollTop;
+      pendingDocPageRef.current =
+        jump && (resource.category === 'document' || resource.category === 'other') ? initialPage : null;
 
       setError(null);
       setPdfDoc(null);
-      setPageNum(saved.pageNum);
-      setPageInput(String(saved.pageNum));
+      setPageNum(initialPage);
+      setPageInput(String(initialPage));
       setZoom(saved.fitZoom);
       setNumPages(0);
       setNoteText('');
@@ -149,7 +173,18 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
         loadingTask.promise
           .then((doc) => {
             if (cancelled) return;
-            const clampedPage = Math.min(Math.max(1, saved.pageNum), doc.numPages);
+            const latestJump =
+              requestedJumpRef.current &&
+              requestedJumpRef.current.resourceId === resource.id &&
+              requestedJumpRef.current.seq !== lastHandledJumpSeqRef.current
+                ? requestedJumpRef.current
+                : null;
+            if (latestJump) {
+              lastHandledJumpSeqRef.current = latestJump.seq;
+              pendingScrollTopRef.current = 0;
+            }
+            const targetPage = latestJump ? latestJump.page : initialPage;
+            const clampedPage = Math.min(Math.max(1, Math.floor(targetPage)), doc.numPages);
             loadedResourceIdRef.current = resource.id;
             setPdfDoc(doc);
             setNumPages(doc.numPages);
@@ -262,6 +297,23 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
       return el ? Array.from(el.querySelectorAll<HTMLElement>(PAGED_DOC_SELECTOR)) : [];
     }, []);
 
+    const scrollToDocPage = useCallback(
+      (page: number, smooth = true): boolean => {
+        const el = scrollContainerRef.current;
+        const pages = getDocPages();
+        if (!el || el.clientHeight <= 0 || pages.length === 0) return false;
+        const clamped = Math.min(Math.max(1, Math.floor(page)), pages.length);
+        const target = pages[clamped - 1];
+        const top =
+          el.scrollTop + target.getBoundingClientRect().top - el.getBoundingClientRect().top - 12;
+        el.scrollTo({ top: Math.max(0, top), behavior: smooth ? 'smooth' : 'auto' });
+        setDocPage(clamped);
+        setDocPageCount(pages.length);
+        return true;
+      },
+      [getDocPages],
+    );
+
     /** Finds which Word page / slide sits at the reading line (40% from the top) of the viewer. */
     const updateDocPage = useCallback(() => {
       const el = scrollContainerRef.current;
@@ -272,6 +324,11 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
         setDocPage(0);
         return;
       }
+      if (pendingDocPageRef.current !== null && el.clientHeight > 0) {
+        const pending = pendingDocPageRef.current;
+        pendingDocPageRef.current = null;
+        if (scrollToDocPage(pending, false)) return;
+      }
       const rect = el.getBoundingClientRect();
       const line = rect.top + el.clientHeight * 0.4;
       let current = 1;
@@ -279,7 +336,42 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
         if (page.getBoundingClientRect().top <= line) current = idx + 1;
       });
       setDocPage(current);
-    }, [resource.category, getDocPages]);
+    }, [resource.category, getDocPages, scrollToDocPage]);
+
+    // Apply declarative jump requests on already-mounted resources and when a hidden viewer becomes visible
+    useEffect(() => {
+      if (!requestedJump || requestedJump.resourceId !== resource.id) return;
+      if (requestedJump.seq === lastHandledJumpSeqRef.current) return;
+
+      if (resource.category === 'pdf') {
+        if (loadedResourceIdRef.current !== resource.id || !pdfDoc || numPages <= 0) return;
+        lastHandledJumpSeqRef.current = requestedJump.seq;
+        const clamped = Math.min(Math.max(1, Math.floor(requestedJump.page)), numPages);
+        pendingScrollTopRef.current = 0;
+        if (scrollContainerRef.current) scrollContainerRef.current.scrollTop = 0;
+        setPageNum(clamped);
+        return;
+      }
+
+      if (resource.category === 'document' || resource.category === 'other') {
+        lastHandledJumpSeqRef.current = requestedJump.seq;
+        pendingScrollTopRef.current = null;
+        const target = Math.max(1, Math.floor(requestedJump.page));
+        if (!scrollToDocPage(target, true)) {
+          pendingDocPageRef.current = target;
+        }
+      }
+    }, [requestedJump, resource.id, resource.category, pdfDoc, numPages, scrollToDocPage]);
+
+    useEffect(() => {
+      if (!isActive || pendingDocPageRef.current === null) return;
+      const raf = window.requestAnimationFrame(() => {
+        if (pendingDocPageRef.current !== null && scrollToDocPage(pendingDocPageRef.current, false)) {
+          pendingDocPageRef.current = null;
+        }
+      });
+      return () => window.cancelAnimationFrame(raf);
+    }, [isActive, scrollToDocPage]);
 
     const docScrollRafRef = useRef<number | null>(null);
     const handleViewerScroll = useCallback(() => {
@@ -306,13 +398,10 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
           setPageNum(Math.min(Math.max(1, Math.floor(page)), numPages));
           return;
         }
-        const el = scrollContainerRef.current;
-        const pages = getDocPages();
-        if (!el || pages.length === 0) return;
-        const target = pages[Math.min(Math.max(1, Math.floor(page)), pages.length) - 1];
-        const top =
-          el.scrollTop + target.getBoundingClientRect().top - el.getBoundingClientRect().top - 12;
-        el.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+        const target = Math.max(1, Math.floor(page));
+        if (!scrollToDocPage(target, true)) {
+          pendingDocPageRef.current = target;
+        }
       },
       captureBaseImage: async () => {
         if (resource.category === 'pdf' && pdfCanvasRef.current) {
@@ -814,6 +903,13 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
               zoom={zoom}
               onLoaded={() => {
                 window.requestAnimationFrame(() => {
+                  if (pendingDocPageRef.current !== null) {
+                    const target = pendingDocPageRef.current;
+                    if (scrollToDocPage(target, false)) {
+                      pendingDocPageRef.current = null;
+                      return;
+                    }
+                  }
                   if (scrollContainerRef.current && pendingScrollTopRef.current !== null) {
                     scrollContainerRef.current.scrollTop = pendingScrollTopRef.current;
                     pendingScrollTopRef.current = null;

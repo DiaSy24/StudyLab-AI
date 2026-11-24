@@ -453,9 +453,9 @@ export interface BuildPromptParams {
   changedContext?: ChangedPromptContext;
 }
 
-/** Shared rule describing the page heading format the client splits on (see src/lib/pageSections.ts). */
+/** Shared rule describing the page heading & source-tag format the client splits on (see src/lib/pageSections.ts). */
 export const PAGE_BY_PAGE_RULE =
-  'SAYFA SAYFA ANLATIM: Öğrenci bir kaynağı "sayfa sayfa", "slayt slayt" veya "her sayfayı" anlatmanı isterse, her sayfanın açıklamasını AYRI bir Markdown başlığıyla başlat: `## Sayfa N` (sunumlarda `## Slayt N`), istersen sonrasına kısa konu ekle (ör. `## Sayfa 3 — Türevin tanımı`). Birlikte anlatılan ardışık sayfalar için `## Sayfa 3-4` yaz. N, dosyadaki FİZİKSEL sayfa sırasıdır (1. sayfa = dosyanın ilk sayfası); sayfanın üzerinde basılı sayfa numarasını kullanma. Her başlığın altında yalnızca o sayfanın içeriğini anlat, başka hiçbir yerde bu biçimde başlık kullanma.';
+  'SAYFA SAYFA ANLATIM: Öğrenci bir kaynağı "sayfa sayfa", "slayt slayt" veya "her sayfayı" anlatmanı isterse, önce anlattığın kaynağın dosya yolunu veya tam dosya adını tek satırda `<!-- kaynak: DOSYA_YOLU -->` olarak yaz (birden fazla kaynak anlatıyorsan her kaynak geçişinde yeni `<!-- kaynak: ... -->` satırı ekle), ardından her sayfanın açıklamasını AYRI bir Markdown başlığıyla başlat: `## Sayfa N` (sunumlarda `## Slayt N`), istersen sonrasına kısa konu ekle (ör. `## Sayfa 3 — Türevin tanımı`). Birlikte anlatılan ardışık sayfalar için `## Sayfa 3-4` yaz. N, dosyadaki FİZİKSEL sayfa sırasıdır (1. sayfa = dosyanın ilk sayfası); sayfanın üzerinde basılı sayfa numarasını kullanma. Her başlığın altında yalnızca o sayfanın içeriğini anlat, başka hiçbir yerde bu biçimde başlık kullanma.';
 
 const PAGE_BY_PAGE_REQUEST_RE = /sayfa\s+sayfa|slayt\s+slayt|her\s+(?:bir\s+)?(?:sayfa|slayt)|page\s+by\s+page|slide\s+by\s+slide/i;
 
@@ -709,13 +709,16 @@ export async function buildStudyPrompt(
 
   const pageByPageRequested = Boolean(pageByPage) || wantsPageByPage(userMessage);
   if (pageByPageRequested) {
-    const startPage = viewingPage && viewingPage > 0 ? viewingPage : 1;
+    const startPage = viewingPath && viewingPage && viewingPage > 0 ? viewingPage : 1;
+    const targetInstruction = viewingPath
+      ? `Öğrenci belirli başka bir kaynak adı belirtmediyse açık olan \`${viewingPath}\` kaynağını (belirli sayfa/aralık istemediyse ${startPage}. sayfadan başla) anlat ve en üste \`<!-- kaynak: ${viewingPath} -->\` ekle; öğrenci farklı bir kaynak istediyse o kaynağın yolunu \`<!-- kaynak: ... -->\` olarak yaz.`
+      : `Öğrencinin belirttiği (veya bağlamdaki ilgili sayfalı) ders kaynağını (aralık belirtmediyse ${startPage}. sayfadan başla) anlat ve sayfa başlıklarından önce mutlaka \`<!-- kaynak: DOSYA_YOLU -->\` satırını ekle.`;
     sections.push(
       '',
       ...(isFollowUp ? [PAGE_BY_PAGE_RULE] : []),
       pageByPage
-        ? `ÖZEL GÖREV (SAYFA SENKRON MODU AÇIK): Öğrenci kaynağı sayfa sayfa takip ediyor; ekranda anlatımın ilgili sayfayla eşleştirilecek. Kaynakla ilgili açıklamalarını mutlaka \`## Sayfa N\` başlıklarıyla sayfalara böl. Öğrenci belirli sayfa/aralık belirtmediyse ${startPage}. sayfadan başla; tek cevapta en fazla 8 sayfa anlat ve sonda "devam" diyerek sonraki sayfalara geçebileceğini belirt.`
-        : `Bu istek sayfa sayfa anlatım istiyor: açıklamaları \`## Sayfa N\` başlıklarıyla sayfalara böl (öğrenci aralık belirtmediyse ${startPage}. sayfadan başla, tek cevapta en fazla 8 sayfa).`,
+        ? `ÖZEL GÖREV (SAYFA SENKRON MODU AÇIK): Öğrenci kaynağı sayfa sayfa takip ediyor; ekranda anlatımın ilgili kaynak ve sayfayla eşleştirilecek. Kaynakla ilgili açıklamalarını mutlaka \`<!-- kaynak: DOSYA_YOLU -->\` ve \`## Sayfa N\` başlıklarıyla sayfalara böl. ${targetInstruction} Tek cevapta en fazla 8 sayfa anlat ve sonda "devam" diyerek sonraki sayfalara geçebileceğini belirt.`
+        : `Bu istek sayfa sayfa anlatım istiyor: açıklamaları \`<!-- kaynak: DOSYA_YOLU -->\` ve \`## Sayfa N\` başlıklarıyla sayfalara böl (${targetInstruction} Tek cevapta en fazla 8 sayfa).`,
     );
   }
 

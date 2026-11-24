@@ -23,12 +23,24 @@ import type {
   ChatMessage,
   ChatSession,
   ExamLanguage,
+  LinkedTreeEntry,
   StudyArtifact,
   StudyMode,
+  StudyResource,
   Workspace,
 } from '../../types/study';
+import {
+  inferMessageSource,
+  isPagedResource,
+  matchStudyResource,
+} from '../../lib/pageSections';
 import { useAutoResizeTextarea } from './useAutoResizeTextarea';
-import { ChatMessageItem, StudyMarkdownBody, useElapsedSeconds } from './ChatMessageItem';
+import {
+  ChatMessageItem,
+  StudyMarkdownBody,
+  useElapsedSeconds,
+  type SourceBadgeInfo,
+} from './ChatMessageItem';
 
 interface TutorChatPanelProps {
   width?: number;
@@ -40,6 +52,10 @@ interface TutorChatPanelProps {
   activeTurnSessionIds: string[];
   messages: ChatMessage[];
   artifacts: StudyArtifact[];
+  resources?: StudyResource[];
+  folderTrees?: Record<string, LinkedTreeEntry[]>;
+  displayedResource?: StudyResource | null;
+  isResourceTabActive?: boolean;
   streamingText: string;
   statusText: string | null;
   isBusy: boolean;
@@ -60,31 +76,65 @@ interface TutorChatPanelProps {
   pageSync?: boolean;
   /** Whether the open resource has pages (PDF / Word / PowerPoint). */
   pageSyncAvailable?: boolean;
-  /** Page currently shown in the resource viewer (only while pageSync is on). */
+  /** Page currently shown in the resource viewer (only while pageSync is on and resource tab is visible). */
   activePage?: number | null;
-  /** Asks the resource viewer to show a page. */
+  /** Resource ID currently shown in the resource viewer. */
+  activeResourceId?: string | null;
+  /** Asks the resource viewer to show a page on the current resource. */
   onRequestPage?: (page: number) => void;
+  /** Asks the stage to open `resourceId` (if given) and navigate to `page`. */
+  onRequestResourcePage?: (resourceId: string | null, page: number) => void;
   onTogglePageSync?: (next: boolean) => void;
 }
 
 /** Ignore viewer page updates for this long after the chat itself moved the viewer. */
 const CHAT_DRIVEN_LOCK_MS = 1000;
+/** Max wait for an async cross-resource switch before releasing the chat-driven target lock. */
+const PENDING_TARGET_TIMEOUT_MS = 2500;
 /** Ignore scroll-based focus picking while a programmatic smooth scroll runs. */
 const PROGRAMMATIC_SCROLL_LOCK_MS = 750;
 const PAGE_REQUEST_DEBOUNCE_MS = 140;
 
 const PAGE_BY_PAGE_TEXT = 'Bu kaynağı şu an baktığım sayfadan itibaren sayfa sayfa anlat.';
 
-function sectionRange(el: HTMLElement): { from: number; to: number } {
-  const from = Number(el.dataset.pageFrom) || 0;
-  const to = Number(el.dataset.pageTo) || from;
-  return { from, to };
+interface SectionDomInfo {
+  from: number;
+  to: number;
+  resourceId: string;
+  resourceLabel: string;
 }
 
-function findLastSectionForPage(sections: HTMLElement[], page: number): HTMLElement | null {
+function sectionInfo(el: HTMLElement): SectionDomInfo {
+  const from = Number(el.dataset.pageFrom) || 0;
+  const to = Number(el.dataset.pageTo) || from;
+  const resourceId = el.dataset.resourceId || '';
+  const resourceLabel = el.dataset.resourceLabel || '';
+  return { from, to, resourceId, resourceLabel };
+}
+
+/**
+ * Finds the latest `.page-section` covering `(resourceId, page)`.
+ * Sections tagged with a different `data-resource-id` never match `resourceId`;
+ * legacy untagged sections (`data-resource-id=""`) match only when no tagged match exists.
+ */
+function findLastSectionForResourcePage(
+  sections: HTMLElement[],
+  resourceId: string | null,
+  page: number,
+): HTMLElement | null {
+  if (resourceId) {
+    for (let i = sections.length - 1; i >= 0; i--) {
+      const info = sectionInfo(sections[i]);
+      if (info.resourceId === resourceId && page >= info.from && page <= info.to) {
+        return sections[i];
+      }
+    }
+  }
   for (let i = sections.length - 1; i >= 0; i--) {
-    const { from, to } = sectionRange(sections[i]);
-    if (page >= from && page <= to) return sections[i];
+    const info = sectionInfo(sections[i]);
+    if (!info.resourceId && page >= info.from && page <= info.to) {
+      return sections[i];
+    }
   }
   return null;
 }
@@ -126,6 +176,10 @@ export const TutorChatPanel: React.FC<TutorChatPanelProps> = ({
   activeTurnSessionIds,
   messages,
   artifacts,
+  resources = [],
+  folderTrees,
+  displayedResource = null,
+  isResourceTabActive = false,
   streamingText,
   statusText,
   isBusy,
@@ -145,7 +199,9 @@ export const TutorChatPanel: React.FC<TutorChatPanelProps> = ({
   pageSync = false,
   pageSyncAvailable = false,
   activePage = null,
+  activeResourceId = null,
   onRequestPage,
+  onRequestResourcePage,
   onTogglePageSync,
 }) => {
   const [input, setInput] = useState('');
@@ -171,27 +227,88 @@ export const TutorChatPanel: React.FC<TutorChatPanelProps> = ({
     }
   };
 
-  // ---- Sayfa Senkron (page-by-page focus) ----
+  // ---- Sayfa Senkron (source-matched page-by-page focus) ----
   const [focusActive, setFocusActive] = useState(false);
+  const [focusedMeta, setFocusedMeta] = useState<{
+    from: number;
+    to: number;
+    label: string;
+  } | null>(null);
   const [missingPage, setMissingPage] = useState<number | null>(null);
   const focusedSectionRef = useRef<HTMLElement | null>(null);
   const programmaticScrollUntilRef = useRef(0);
   const chatDrivenUntilRef = useRef(0);
+  const pendingChatTargetRef = useRef<{
+    resourceId: string | null;
+    from: number;
+    to: number;
+    expiresAt: number;
+  } | null>(null);
+  const suppressNextEnableOpenRef = useRef(false);
+  const prevPageSyncRef = useRef(pageSync);
+  const wasBusyRef = useRef(isBusy);
   const pageRequestTimerRef = useRef<number | null>(null);
   const pickRafRef = useRef<number | null>(null);
   const pageSyncRef = useRef(pageSync);
   pageSyncRef.current = pageSync;
   const activePageRef = useRef(activePage);
   activePageRef.current = activePage;
+  const activeResourceIdRef = useRef(activeResourceId);
+  activeResourceIdRef.current = activeResourceId;
+  const isResourceTabActiveRef = useRef(isResourceTabActive);
+  isResourceTabActiveRef.current = isResourceTabActive;
   const onRequestPageRef = useRef(onRequestPage);
   onRequestPageRef.current = onRequestPage;
+  const onRequestResourcePageRef = useRef(onRequestResourcePage);
+  onRequestResourcePageRef.current = onRequestResourcePage;
+
+  const handleResolveSource = useCallback(
+    (hint: string): SourceBadgeInfo | null => {
+      const matched = matchStudyResource(hint, resources, folderTrees);
+      return matched ? { id: matched.id, label: matched.label } : null;
+    },
+    [resources, folderTrees],
+  );
+
+  const defaultSourceByMsgId = useMemo(() => {
+    const map = new Map<string, SourceBadgeInfo>();
+    let lastUser: ChatMessage | null = null;
+    for (const msg of messages) {
+      if (msg.role === 'user') {
+        lastUser = msg;
+        continue;
+      }
+      const inferred = inferMessageSource(msg, lastUser, resources, folderTrees);
+      if (inferred) {
+        map.set(msg.id, { id: inferred.id, label: inferred.label });
+      }
+    }
+    return map;
+  }, [messages, resources, folderTrees]);
+
+  const streamingDefaultSource = useMemo<SourceBadgeInfo | null>(() => {
+    if (!isBusy) return null;
+    let lastUser: ChatMessage | null = null;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') {
+        lastUser = messages[i];
+        break;
+      }
+    }
+    const inferred = inferMessageSource(null, lastUser, resources, folderTrees);
+    if (inferred) return { id: inferred.id, label: inferred.label };
+    if (displayedResource && displayedResource.category !== 'folder' && isPagedResource(displayedResource)) {
+      return { id: displayedResource.id, label: displayedResource.name };
+    }
+    return null;
+  }, [isBusy, messages, resources, folderTrees, displayedResource]);
 
   const getSections = useCallback((): HTMLElement[] => {
     const el = scrollContainerRef.current;
     return el ? Array.from(el.querySelectorAll<HTMLElement>('.page-section')) : [];
   }, []);
 
-  /** Moves the focus highlight via DOM classes only, so memoized messages don't re-render. */
+  /** Moves the focus highlight via DOM classes so memoized messages don't re-render. */
   const applyFocus = useCallback((section: HTMLElement | null) => {
     const container = scrollContainerRef.current;
     if (focusedSectionRef.current !== section) {
@@ -206,6 +323,17 @@ export const TutorChatPanel: React.FC<TutorChatPanelProps> = ({
       let item: HTMLElement | null = section;
       while (item && item.parentElement !== container) item = item.parentElement;
       item?.classList.add('has-page-focus');
+      const info = sectionInfo(section);
+      setFocusedMeta((prev) =>
+        prev &&
+        prev.from === info.from &&
+        prev.to === info.to &&
+        prev.label === info.resourceLabel
+          ? prev
+          : { from: info.from, to: info.to, label: info.resourceLabel },
+      );
+    } else {
+      setFocusedMeta(null);
     }
     setFocusActive(Boolean(section));
   }, []);
@@ -229,41 +357,116 @@ export const TutorChatPanel: React.FC<TutorChatPanelProps> = ({
     [applyFocus],
   );
 
-  /** Chat -> viewer: focus the section crossing the vertical middle of the feed and open its page. */
+  /** Returns the `.page-section` currently visible inside the chat viewport closest to its middle. */
+  const pickVisibleSection = useCallback((): HTMLElement | null => {
+    const container = scrollContainerRef.current;
+    if (!container) return null;
+    const sections = getSections();
+    if (sections.length === 0) return null;
+    const cr = container.getBoundingClientRect();
+    if (cr.height <= 0) return null;
+    const mid = cr.top + cr.height / 2;
+    let best: HTMLElement | null = null;
+    let bestDist = Infinity;
+    for (const sec of sections) {
+      const r = sec.getBoundingClientRect();
+      if (r.bottom <= cr.top + 8 || r.top >= cr.bottom - 8) continue;
+      const dist = mid < r.top ? r.top - mid : mid > r.bottom ? mid - r.bottom : 0;
+      if (dist <= bestDist) {
+        bestDist = dist;
+        best = sec;
+      }
+    }
+    return best;
+  }, [getSections]);
+
+  /** Opens the matched resource and starting page of `sec` in the stage viewer. */
+  const openSectionTarget = useCallback((sec: HTMLElement, immediate = false) => {
+    const { from, to, resourceId } = sectionInfo(sec);
+    if (!from) return;
+    const currentResId = activeResourceIdRef.current;
+    const currentPage = activePageRef.current;
+    const tabOpen = isResourceTabActiveRef.current;
+    const sameResource = !resourceId ? Boolean(currentResId) : currentResId === resourceId;
+
+    if (tabOpen && sameResource && currentPage !== null && currentPage >= from && currentPage <= to) {
+      return;
+    }
+
+    if (pageRequestTimerRef.current !== null) {
+      window.clearTimeout(pageRequestTimerRef.current);
+      pageRequestTimerRef.current = null;
+    }
+
+    const fire = () => {
+      pageRequestTimerRef.current = null;
+      chatDrivenUntilRef.current = Date.now() + CHAT_DRIVEN_LOCK_MS;
+      pendingChatTargetRef.current = {
+        resourceId: resourceId || null,
+        from,
+        to,
+        expiresAt: Date.now() + PENDING_TARGET_TIMEOUT_MS,
+      };
+      if (onRequestResourcePageRef.current) {
+        onRequestResourcePageRef.current(resourceId || null, from);
+      } else {
+        onRequestPageRef.current?.(from);
+      }
+    };
+
+    if (immediate) {
+      fire();
+    } else {
+      pageRequestTimerRef.current = window.setTimeout(fire, PAGE_REQUEST_DEBOUNCE_MS);
+    }
+  }, []);
+
+  /** Chat -> viewer: focus the visible section crossing the middle of the feed and open its source/page. */
   const pickFocusFromScroll = useCallback(
     (requestPage: boolean) => {
-      const container = scrollContainerRef.current;
-      if (!container || !pageSyncRef.current) return;
-      const sections = getSections();
-      if (sections.length === 0) return;
-      const cr = container.getBoundingClientRect();
-      const mid = cr.top + container.clientHeight / 2;
-      let best: HTMLElement | null = null;
-      let bestDist = Infinity;
-      for (const sec of sections) {
-        const r = sec.getBoundingClientRect();
-        const dist = mid < r.top ? r.top - mid : mid > r.bottom ? mid - r.bottom : 0;
-        if (dist <= bestDist) {
-          bestDist = dist;
-          best = sec;
-        }
+      if (!pageSyncRef.current) return;
+      const best = pickVisibleSection();
+      if (!best) {
+        applyFocus(null);
+        return;
       }
-      if (!best) return;
       applyFocus(best);
       setMissingPage(null);
-      if (!requestPage) return;
-      const { from, to } = sectionRange(best);
-      const current = activePageRef.current;
-      if (!from || (current && current >= from && current <= to)) return;
-      if (pageRequestTimerRef.current !== null) window.clearTimeout(pageRequestTimerRef.current);
-      pageRequestTimerRef.current = window.setTimeout(() => {
-        pageRequestTimerRef.current = null;
-        chatDrivenUntilRef.current = Date.now() + CHAT_DRIVEN_LOCK_MS;
-        onRequestPageRef.current?.(from);
-      }, PAGE_REQUEST_DEBOUNCE_MS);
+      if (requestPage) {
+        openSectionTarget(best, false);
+      }
     },
-    [applyFocus, getSections],
+    [applyFocus, openSectionTarget, pickVisibleSection],
   );
+
+  const handleOpenSourcePage = useCallback(
+    (resourceId: string | null, page: number, sectionEl?: HTMLElement | null) => {
+      if (pageSyncRef.current && sectionEl) {
+        applyFocus(sectionEl);
+        setMissingPage(null);
+        openSectionTarget(sectionEl, true);
+        return;
+      }
+      if (onRequestResourcePageRef.current) {
+        onRequestResourcePageRef.current(resourceId, page);
+      } else {
+        onRequestPageRef.current?.(page);
+      }
+    },
+    [applyFocus, openSectionTarget],
+  );
+
+  const handleFeedClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!pageSync) return;
+    if (window.getSelection()?.toString()) return;
+    const target = e.target as HTMLElement | null;
+    if (!target || target.closest('a, button, input, textarea, select')) return;
+    const sec = target.closest<HTMLElement>('.page-section');
+    if (!sec) return;
+    applyFocus(sec);
+    setMissingPage(null);
+    openSectionTarget(sec, true);
+  };
 
   const handleFeedScroll = () => {
     const el = scrollContainerRef.current;
@@ -281,29 +484,79 @@ export const TutorChatPanel: React.FC<TutorChatPanelProps> = ({
     }
   };
 
-  // Viewer -> chat: when the viewer's page changes, center that page's explanation.
+  // Toggle-on focus -> viewer open, plus Viewer -> chat synchronization.
   useEffect(() => {
-    if (!pageSync || !activePage) {
+    const justEnabled = !prevPageSyncRef.current && pageSync;
+    prevPageSyncRef.current = pageSync;
+
+    if (!pageSync) {
+      pendingChatTargetRef.current = null;
       applyFocus(null);
       setMissingPage(null);
       return;
     }
+
+    if (justEnabled) {
+      if (suppressNextEnableOpenRef.current) {
+        suppressNextEnableOpenRef.current = false;
+      } else {
+        const currentFocused =
+          focusedSectionRef.current && focusedSectionRef.current.isConnected
+            ? focusedSectionRef.current
+            : null;
+        const visibleTarget = currentFocused || pickVisibleSection();
+        if (visibleTarget) {
+          applyFocus(visibleTarget);
+          setMissingPage(null);
+          openSectionTarget(visibleTarget, true);
+          return;
+        }
+      }
+    }
+
+    // Wait for any chat-initiated async resource/page jump to finish before syncing Viewer -> chat.
+    const pending = pendingChatTargetRef.current;
+    if (pending) {
+      if (Date.now() < pending.expiresAt) {
+        const landedResource = !pending.resourceId || activeResourceId === pending.resourceId;
+        if (
+          isResourceTabActive &&
+          landedResource &&
+          activePage !== null &&
+          activePage >= pending.from &&
+          activePage <= pending.to
+        ) {
+          pendingChatTargetRef.current = null;
+          chatDrivenUntilRef.current = 0;
+          setMissingPage(null);
+        }
+        return;
+      }
+      pendingChatTargetRef.current = null;
+    }
+
+    if (Date.now() < chatDrivenUntilRef.current) return;
+
+    if (!isResourceTabActive || !activePage) {
+      setMissingPage(null);
+      return;
+    }
+
     const container = scrollContainerRef.current;
     if (!container) return;
-    // The chat just moved the viewer: don't bounce the feed back.
-    if (Date.now() < chatDrivenUntilRef.current) return;
 
     const current = focusedSectionRef.current;
     if (current && current.isConnected) {
-      const { from, to } = sectionRange(current);
-      if (activePage >= from && activePage <= to) {
+      const info = sectionInfo(current);
+      const sameSource = !info.resourceId || info.resourceId === activeResourceId;
+      if (sameSource && activePage >= info.from && activePage <= info.to) {
         setMissingPage(null);
         return;
       }
     }
 
     const sections = getSections();
-    const target = findLastSectionForPage(sections, activePage);
+    const target = findLastSectionForResourcePage(sections, activeResourceId, activePage);
     if (!target) {
       applyFocus(null);
       setMissingPage(sections.length > 0 ? activePage : null);
@@ -311,34 +564,91 @@ export const TutorChatPanel: React.FC<TutorChatPanelProps> = ({
     }
 
     centerSection(target);
-  }, [pageSync, activePage, applyFocus, centerSection, getSections]);
+  }, [
+    pageSync,
+    isResourceTabActive,
+    activeResourceId,
+    activePage,
+    applyFocus,
+    centerSection,
+    getSections,
+    openSectionTarget,
+    pickVisibleSection,
+  ]);
 
-  // Re-attach the focus when messages re-render (e.g. the streamed reply becomes a saved message).
+  // Re-attach focus when messages re-render or when a streamed page-by-page reply finishes.
   useEffect(() => {
+    const justFinishedTurn = wasBusyRef.current && !isBusy;
+    wasBusyRef.current = isBusy;
     if (!pageSync) return;
-    const current = focusedSectionRef.current;
-    if (current && current.isConnected) return;
+
     const raf = window.requestAnimationFrame(() => {
       if (isBusy) {
-        // While a reply streams, only highlight the section in the middle; don't move the viewer.
-        pickFocusFromScroll(false);
+        // While a reply streams, highlight the visible section; don't flip viewer pages mid-stream.
+        const vis = pickVisibleSection();
+        if (vis) applyFocus(vis);
         return;
       }
-      const page = activePageRef.current;
+
+      const current = focusedSectionRef.current;
+      if (!justFinishedTurn && current && current.isConnected) return;
+
       const sections = getSections();
-      const target = page ? findLastSectionForPage(sections, page) : null;
+      if (sections.length === 0) return;
+
+      const curResId = activeResourceIdRef.current;
+      const curPage = activePageRef.current;
+      const tabOpen = isResourceTabActiveRef.current;
+
+      if (justFinishedTurn) {
+        const container = scrollContainerRef.current;
+        const assistantNodes = container
+          ? Array.from(container.querySelectorAll<HTMLElement>('[data-message-role="assistant"]'))
+          : [];
+        const latestAssistant = assistantNodes[assistantNodes.length - 1] ?? null;
+        const newSections = latestAssistant
+          ? Array.from(latestAssistant.querySelectorAll<HTMLElement>('.page-section'))
+          : [];
+        if (newSections.length > 0) {
+          const matchForOpen =
+            tabOpen && curPage
+              ? findLastSectionForResourcePage(newSections, curResId, curPage)
+              : null;
+          if (matchForOpen) {
+            centerSection(matchForOpen);
+            return;
+          }
+          const firstNew = newSections[0];
+          centerSection(firstNew);
+          openSectionTarget(firstNew, true);
+          return;
+        }
+      }
+
+      const target =
+        tabOpen && curPage ? findLastSectionForResourcePage(sections, curResId, curPage) : null;
       if (target) {
-        // A reply just landed: bring the explanation of the page being viewed into focus.
         centerSection(target);
-      } else if (page && sections.length > 0) {
+      } else if (tabOpen && curPage) {
         applyFocus(null);
-        setMissingPage(page);
+        setMissingPage(curPage);
       } else {
-        pickFocusFromScroll(false);
+        const vis = pickVisibleSection();
+        applyFocus(vis);
       }
     });
     return () => window.cancelAnimationFrame(raf);
-  }, [pageSync, messages, streamingText, isBusy, applyFocus, centerSection, getSections, pickFocusFromScroll]);
+  }, [
+    pageSync,
+    messages,
+    streamingText,
+    isBusy,
+    applyFocus,
+    centerSection,
+    getSections,
+    openSectionTarget,
+    pickVisibleSection,
+  ]);
 
   useEffect(
     () => () => {
@@ -350,11 +660,19 @@ export const TutorChatPanel: React.FC<TutorChatPanelProps> = ({
 
   const handleExplainPageByPage = async () => {
     if (isBusy || !workspace) return;
-    if (!pageSync && pageSyncAvailable) onTogglePageSync?.(true);
+    if (!pageSync) {
+      suppressNextEnableOpenRef.current = true;
+      onTogglePageSync?.(true);
+    }
     autoScrollRef.current = true;
     setShowScrollToBottom(false);
-    // Send the mode explicitly: the toggle's state update hasn't reached the parent's send callback yet.
-    await onSendMessage(PAGE_BY_PAGE_TEXT, { pageByPage: pageSync || pageSyncAvailable });
+    const promptText =
+      isResourceTabActive && pageSyncAvailable
+        ? PAGE_BY_PAGE_TEXT
+        : displayedResource && displayedResource.category !== 'folder' && isPagedResource(displayedResource)
+          ? `"${displayedResource.name}" kaynağını sayfa sayfa anlat.`
+          : 'Ders kaynağını baştan itibaren sayfa sayfa anlat.';
+    await onSendMessage(promptText, { pageByPage: true });
   };
 
   // Reset scroll to bottom when switching workspaces or chat sessions
@@ -653,24 +971,43 @@ export const TutorChatPanel: React.FC<TutorChatPanelProps> = ({
         {pageSync && (
           <div className="flex shrink-0 justify-center border-b border-slate-800/90 bg-slate-950 px-4 py-1.5">
             {missingPage && !isBusy ? (
-              <div className="flex items-center gap-2 rounded-full border border-indigo-500/40 bg-slate-900/95 py-1 pr-1 pl-3 text-[11px] text-slate-300 ">
-                <BookOpenText className="h-3.5 w-3.5 text-indigo-300" />
-                <span>Sayfa {missingPage} için açıklama yok</span>
+              <div className="flex max-w-full items-center gap-2 rounded-full border border-indigo-500/40 bg-slate-900/95 py-1 pr-1 pl-3 text-[11px] text-slate-300">
+                <BookOpenText className="h-3.5 w-3.5 shrink-0 text-indigo-300" />
+                <span className="truncate">
+                  {isResourceTabActive && displayedResource && displayedResource.category !== 'folder'
+                    ? `${displayedResource.name} • `
+                    : ''}
+                  Sayfa {missingPage} için açıklama yok
+                </span>
                 <button
                   type="button"
                   onClick={() => {
                     autoScrollRef.current = true;
                     void onSendMessage(`${missingPage}. sayfayı sayfa sayfa anlat.`, { pageByPage: true });
                   }}
-                  className="rounded-full bg-indigo-600 px-2.5 py-0.5 font-semibold text-white transition hover:bg-indigo-500"
+                  className="shrink-0 rounded-full bg-indigo-600 px-2.5 py-0.5 font-semibold text-white transition hover:bg-indigo-500"
                 >
                   Bu sayfayı açıkla
                 </button>
               </div>
             ) : (
-              <div className="flex items-center gap-1.5 rounded-full bg-indigo-600/90 px-2.5 py-0.5 text-[10px] font-semibold text-white shadow">
-                <BookOpenText className="h-3 w-3" />
-                Sayfa Senkron{activePage ? ` • Sayfa ${activePage}` : pageSyncAvailable ? '' : ' • sayfalı kaynak aç'}
+              <div className="flex max-w-full items-center gap-1.5 rounded-full bg-indigo-600/90 px-2.5 py-0.5 text-[10px] font-semibold text-white shadow">
+                <BookOpenText className="h-3 w-3 shrink-0" />
+                <span className="truncate">
+                  Sayfa Senkron
+                  {focusedMeta?.label
+                    ? ` • ${focusedMeta.label}`
+                    : isResourceTabActive && displayedResource && displayedResource.category !== 'folder'
+                      ? ` • ${displayedResource.name}`
+                      : ''}
+                  {activePage
+                    ? ` • Sayfa ${activePage}`
+                    : focusedMeta?.from
+                      ? ` • Sayfa ${focusedMeta.from}${focusedMeta.to > focusedMeta.from ? `-${focusedMeta.to}` : ''}`
+                      : pageSyncAvailable
+                        ? ''
+                        : ' • kaynak veya açıklama seç'}
+                </span>
               </div>
             )}
           </div>
@@ -679,6 +1016,7 @@ export const TutorChatPanel: React.FC<TutorChatPanelProps> = ({
         <div
           ref={scrollContainerRef}
           onScroll={handleFeedScroll}
+          onClick={handleFeedClick}
           className={`min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4 [overflow-anchor:none] ${
             pageSync && focusActive ? 'page-sync-on' : ''
           }`}
@@ -699,6 +1037,9 @@ export const TutorChatPanel: React.FC<TutorChatPanelProps> = ({
             message={msg}
             linkedArtifacts={linkedArtifactsByMsgId.get(msg.id) ?? emptyArtifacts}
             variant="main"
+            defaultSource={defaultSourceByMsgId.get(msg.id) ?? null}
+            onResolveSource={handleResolveSource}
+            onOpenSourcePage={handleOpenSourcePage}
             onOpenArtifact={onOpenArtifact}
           />
         ))}
@@ -715,7 +1056,12 @@ export const TutorChatPanel: React.FC<TutorChatPanelProps> = ({
             </div>
             <div className="w-[92%] rounded-2xl border border-indigo-500/30 bg-slate-900/90 px-3.5 py-2.5">
               {streamingText ? (
-                <StudyMarkdownBody markdown={streamingText} />
+                <StudyMarkdownBody
+                  markdown={streamingText}
+                  defaultSource={streamingDefaultSource}
+                  onResolveSource={handleResolveSource}
+                  onOpenSourcePage={handleOpenSourcePage}
+                />
               ) : (
                 <div className="flex items-center gap-2 py-1 text-xs text-slate-400">
                   <span className="h-2 w-2 animate-pulse rounded-full bg-indigo-400" />

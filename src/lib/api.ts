@@ -458,6 +458,8 @@ export const api = {
       annotation?: AnnotationAttachment;
       coStudyAction?: 'check-step' | 'hint' | 'visualize-board' | 'fix-artifact';
       artifactError?: string;
+      /** Resource ID (or virtual `<folderId>::<innerPath>`) currently open in the viewer. */
+      viewingResourceId?: string;
       /** Path of the file the student is currently looking at in the resource viewer. */
       viewingPath?: string;
       /** 1-based page/slide currently shown for `viewingPath`. */
