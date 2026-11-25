@@ -148,6 +148,9 @@ function DocxView({ url, zoom, onError, onLoaded }: { url: string; zoom: number;
     })();
     return () => {
       cancelled = true;
+      if (hostRef.current) {
+        hostRef.current.innerHTML = '';
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url]);
@@ -195,6 +198,9 @@ function PptxView({ url, zoom, onError, onLoaded }: { url: string; zoom: number;
         previewer?.destroy();
       } catch {
         // ignore
+      }
+      if (hostRef.current) {
+        hostRef.current.innerHTML = '';
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

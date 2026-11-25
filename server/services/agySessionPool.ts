@@ -62,8 +62,8 @@ interface WarmProcessEntry {
   aborted: boolean;
 }
 
-const DEFAULT_IDLE_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const DEFAULT_MAX_WARM_SESSIONS = 4;
+const DEFAULT_IDLE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const DEFAULT_MAX_WARM_SESSIONS = 2;
 
 const isolatedDirs = new Set<string>();
 

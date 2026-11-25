@@ -4,6 +4,7 @@ import {
   ChevronRight,
   FileText,
   FolderOpen,
+  Loader2,
   Pencil,
   ZoomIn,
   ZoomOut,
@@ -11,6 +12,13 @@ import {
 import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { renderStudyMarkdown } from '../../lib/markdown';
+import {
+  buildPdfScaleKey,
+  computePdfRenderMetrics,
+  getPrefetchTargets,
+  PdfPageCache,
+  type PdfCachedPage,
+} from '../../lib/pdfPageCache';
 import { shouldIgnoreNavKeyEvent, type SiblingNavigation } from '../../lib/resourceNavigation';
 import { CodeView } from './CodeView';
 import { DocumentView } from './DocumentView';
@@ -57,6 +65,22 @@ const MAX_ZOOM = 4;
 const DEFAULT_ZOOM = 1;
 const ZOOM_STEP = 0.2;
 const VIEWER_PADDING_PX = 40; // p-5 on both sides
+const PDF_RANGE_CHUNK_SIZE = 512 * 1024; // 512 KB range chunks over localhost
+const PDF_CANVAS_MAX_AREA_BYTES = 64 * 1024 * 1024; // 64 MB worker image resize cap
+const PDF_PREFETCH_DELAY_MS = 80;
+const PDF_PAGE_KEEP_RADIUS = 2;
+const PDF_WHEEL_RENDER_DEBOUNCE_MS = 120;
+const PDF_RENDER_BADGE_DELAY_MS = 120;
+const SCROLL_SAVE_DEBOUNCE_MS = 250;
+
+function safeCancelRender(task: pdfjsLib.RenderTask | null): void {
+  if (!task) return;
+  try {
+    task.cancel();
+  } catch {
+    // ignore already settled render task
+  }
+}
 
 function getStorageKey(resourceId: string): string {
   return `studylab.resourceState.${resourceId}`;
@@ -104,21 +128,145 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
     requestedJumpRef.current = requestedJump;
     const lastHandledJumpSeqRef = useRef<number>(-1);
     const pendingDocPageRef = useRef<number | null>(null);
+    const pdfDocRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
+    const loadingTaskRef = useRef<pdfjsLib.PDFDocumentLoadingTask | null>(null);
+    const pdfPageCacheRef = useRef<PdfPageCache>(new PdfPageCache());
+    const pdfPagesRef = useRef<Map<number, pdfjsLib.PDFPageProxy>>(new Map());
+    const activeRenderTaskRef = useRef<pdfjsLib.RenderTask | null>(null);
+    const prefetchRenderTaskRef = useRef<pdfjsLib.RenderTask | null>(null);
+    const prefetchTimerRef = useRef<number | null>(null);
+    const prefetchRunIdRef = useRef(0);
+    const isActiveRef = useRef(isActive);
+    isActiveRef.current = isActive;
+    const renderZoomTimerRef = useRef<number | null>(null);
+    const zoomAnchorRafRef = useRef<number | null>(null);
+    const saveStateTimerRef = useRef<number | null>(null);
+    const pendingSaveRef = useRef<{ resourceId: string; state: StoredViewerState } | null>(null);
+    const lastPaintedSizeRef = useRef<{ cssWidth: number; cssHeight: number; zoom: number } | null>(null);
 
     const initialState = loadViewerState(resource.id);
+    const lastPageNumRef = useRef(initialState.pageNum);
+    const navDirectionRef = useRef<1 | -1>(1);
     const [pdfDoc, setPdfDoc] = useState<pdfjsLib.PDFDocumentProxy | null>(null);
     const [pageNum, setPageNum] = useState(initialState.pageNum);
     const [pageInput, setPageInput] = useState(String(initialState.pageNum));
     const [fileIndexInput, setFileIndexInput] = useState(String((siblingNav?.index ?? 0) + 1));
     const [numPages, setNumPages] = useState(0);
     const [zoom, setZoom] = useState(initialState.fitZoom);
+    const [renderZoom, setRenderZoom] = useState(initialState.fitZoom);
     const [containerWidth, setContainerWidth] = useState(0);
     const [loading, setLoading] = useState(false);
+    const [pdfCanvasReady, setPdfCanvasReady] = useState(false);
+    const [pdfPageRendering, setPdfPageRendering] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [noteText, setNoteText] = useState<string>('');
     // Word pages / PowerPoint slides are stacked in one scroll; track the one in view.
     const [docPage, setDocPage] = useState(0);
     const [docPageCount, setDocPageCount] = useState(0);
+
+    const flushPendingViewerState = useCallback(() => {
+      if (saveStateTimerRef.current !== null) {
+        window.clearTimeout(saveStateTimerRef.current);
+        saveStateTimerRef.current = null;
+      }
+      if (pendingSaveRef.current) {
+        const { resourceId, state } = pendingSaveRef.current;
+        pendingSaveRef.current = null;
+        saveViewerState(resourceId, state);
+      }
+    }, []);
+
+    const scheduleSaveViewerState = useCallback((resourceId: string, state: StoredViewerState) => {
+      pendingSaveRef.current = { resourceId, state };
+      if (saveStateTimerRef.current !== null) {
+        window.clearTimeout(saveStateTimerRef.current);
+      }
+      saveStateTimerRef.current = window.setTimeout(() => {
+        saveStateTimerRef.current = null;
+        if (pendingSaveRef.current) {
+          const pending = pendingSaveRef.current;
+          pendingSaveRef.current = null;
+          saveViewerState(pending.resourceId, pending.state);
+        }
+      }, SCROLL_SAVE_DEBOUNCE_MS);
+    }, []);
+
+    const cancelPrefetch = useCallback(() => {
+      prefetchRunIdRef.current += 1;
+      if (prefetchTimerRef.current !== null) {
+        window.clearTimeout(prefetchTimerRef.current);
+        prefetchTimerRef.current = null;
+      }
+      safeCancelRender(prefetchRenderTaskRef.current);
+      prefetchRenderTaskRef.current = null;
+    }, []);
+
+    const cleanupDistantPdfPages = useCallback((centerPage: number) => {
+      for (const [p, proxy] of Array.from(pdfPagesRef.current.entries())) {
+        if (Math.abs(p - centerPage) > PDF_PAGE_KEEP_RADIUS) {
+          pdfPagesRef.current.delete(p);
+          try {
+            proxy.cleanup();
+          } catch {
+            // ignore page cleanup failures on destroyed documents
+          }
+        }
+      }
+    }, []);
+
+    const cleanupPdfResources = useCallback(
+      (destroyDoc: boolean) => {
+        cancelPrefetch();
+        safeCancelRender(activeRenderTaskRef.current);
+        activeRenderTaskRef.current = null;
+        pdfPageCacheRef.current.clear();
+        for (const proxy of pdfPagesRef.current.values()) {
+          try {
+            proxy.cleanup();
+          } catch {
+            // ignore
+          }
+        }
+        pdfPagesRef.current.clear();
+        lastPaintedSizeRef.current = null;
+
+        if (destroyDoc) {
+          const lt = loadingTaskRef.current;
+          loadingTaskRef.current = null;
+          const doc = pdfDocRef.current;
+          pdfDocRef.current = null;
+          if (doc) {
+            void doc.destroy().catch(() => {});
+          } else if (lt) {
+            void lt.destroy().catch(() => {});
+          }
+          const canvas = pdfCanvasRef.current;
+          if (canvas) {
+            canvas.width = 0;
+            canvas.height = 0;
+            canvas.style.width = '';
+            canvas.style.height = '';
+          }
+        }
+      },
+      [cancelPrefetch],
+    );
+
+    // Ensure all timers and PDF/worker allocations are released on unmount
+    useEffect(() => {
+      return () => {
+        flushPendingViewerState();
+        if (renderZoomTimerRef.current !== null) {
+          window.clearTimeout(renderZoomTimerRef.current);
+          renderZoomTimerRef.current = null;
+        }
+        if (zoomAnchorRafRef.current !== null) {
+          window.cancelAnimationFrame(zoomAnchorRafRef.current);
+          zoomAnchorRafRef.current = null;
+        }
+        cleanupPdfResources(true);
+      };
+    }, [flushPendingViewerState, cleanupPdfResources]);
 
     // Keep page input synchronized with active page number
     useEffect(() => {
@@ -136,11 +284,14 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
     useEffect(() => {
       if (loadedResourceIdRef.current !== resource.id) return;
       const scrollTop = scrollContainerRef.current?.scrollTop ?? 0;
-      saveViewerState(resource.id, { pageNum, fitZoom: zoom, scrollTop });
-    }, [resource.id, pageNum, zoom]);
+      scheduleSaveViewerState(resource.id, { pageNum, fitZoom: zoom, scrollTop });
+    }, [resource.id, pageNum, zoom, scheduleSaveViewerState]);
 
     useEffect(() => {
       let cancelled = false;
+      flushPendingViewerState();
+      cleanupPdfResources(true);
+
       const saved = loadViewerState(resource.id);
       const jump =
         requestedJumpRef.current &&
@@ -152,16 +303,26 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
         lastHandledJumpSeqRef.current = jump.seq;
       }
       const initialPage = jump ? Math.max(1, Math.floor(jump.page)) : saved.pageNum;
+      lastPageNumRef.current = initialPage;
+      navDirectionRef.current = 1;
       loadedResourceIdRef.current = null;
       pendingScrollTopRef.current = jump ? (resource.category === 'pdf' ? 0 : null) : saved.scrollTop;
       pendingDocPageRef.current =
         jump && (resource.category === 'document' || resource.category === 'other') ? initialPage : null;
 
+      if (renderZoomTimerRef.current !== null) {
+        window.clearTimeout(renderZoomTimerRef.current);
+        renderZoomTimerRef.current = null;
+      }
+
       setError(null);
       setPdfDoc(null);
+      setPdfCanvasReady(false);
+      setPdfPageRendering(false);
       setPageNum(initialPage);
       setPageInput(String(initialPage));
       setZoom(saved.fitZoom);
+      setRenderZoom(saved.fitZoom);
       setNumPages(0);
       setNoteText('');
       setDocPage(0);
@@ -169,10 +330,23 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
 
       if (resource.category === 'pdf') {
         setLoading(true);
-        const loadingTask = pdfjsLib.getDocument(resource.url);
+        const loadingTask = pdfjsLib.getDocument({
+          url: resource.url,
+          disableRange: false,
+          disableStream: true,
+          disableAutoFetch: true,
+          rangeChunkSize: PDF_RANGE_CHUNK_SIZE,
+          canvasMaxAreaInBytes: PDF_CANVAS_MAX_AREA_BYTES,
+        });
+        loadingTaskRef.current = loadingTask;
         loadingTask.promise
           .then((doc) => {
-            if (cancelled) return;
+            if (cancelled) {
+              void doc.destroy().catch(() => {});
+              return;
+            }
+            pdfDocRef.current = doc;
+            loadingTaskRef.current = null;
             const latestJump =
               requestedJumpRef.current &&
               requestedJumpRef.current.resourceId === resource.id &&
@@ -185,18 +359,19 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
             }
             const targetPage = latestJump ? latestJump.page : initialPage;
             const clampedPage = Math.min(Math.max(1, Math.floor(targetPage)), doc.numPages);
+            lastPageNumRef.current = clampedPage;
             loadedResourceIdRef.current = resource.id;
             setPdfDoc(doc);
             setNumPages(doc.numPages);
             setPageNum(clampedPage);
             setPageInput(String(clampedPage));
+            setLoading(false);
           })
           .catch((err) => {
             if (cancelled) return;
+            loadingTaskRef.current = null;
             setError(`PDF yüklenemedi: ${err instanceof Error ? err.message : String(err)}`);
-          })
-          .finally(() => {
-            if (!cancelled) setLoading(false);
+            setLoading(false);
           });
       } else if (resource.category === 'note') {
         setLoading(true);
@@ -206,6 +381,7 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
             if (cancelled) return;
             loadedResourceIdRef.current = resource.id;
             setNoteText(txt);
+            setLoading(false);
             window.requestAnimationFrame(() => {
               if (scrollContainerRef.current && pendingScrollTopRef.current !== null) {
                 scrollContainerRef.current.scrollTop = pendingScrollTopRef.current;
@@ -214,12 +390,13 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
             });
           })
           .catch(() => {
-            if (!cancelled) setError('Not dosyası okunamadı.');
-          })
-          .finally(() => {
-            if (!cancelled) setLoading(false);
+            if (!cancelled) {
+              setError('Not dosyası okunamadı.');
+              setLoading(false);
+            }
           });
       } else {
+        setLoading(false);
         loadedResourceIdRef.current = resource.id;
         if (resource.category === 'image') {
           window.requestAnimationFrame(() => {
@@ -233,8 +410,10 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
 
       return () => {
         cancelled = true;
+        flushPendingViewerState();
+        cleanupPdfResources(true);
       };
-    }, [resource.id, resource.url, resource.category]);
+    }, [resource.id, resource.url, resource.category, flushPendingViewerState, cleanupPdfResources]);
 
     // Track the available width so "fit to width" follows panel resizes.
     useEffect(() => {
@@ -250,47 +429,279 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
       return () => ro.disconnect();
     }, []);
 
-    // Render active PDF page to canvas
-    useEffect(() => {
-      if (!pdfDoc || !pdfCanvasRef.current || containerWidth <= 0) return;
-      const safePage = Math.min(Math.max(1, pageNum), pdfDoc.numPages);
-      let renderTask: pdfjsLib.RenderTask | null = null;
-      let cancelled = false;
+    const paintCachedPage = useCallback((entry: PdfCachedPage, targetZoom: number) => {
+      const canvas = pdfCanvasRef.current;
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d', { alpha: false }) ?? canvas.getContext('2d');
+      if (!ctx) return;
 
-      pdfDoc.getPage(safePage).then((page) => {
-        if (cancelled || !pdfCanvasRef.current) return;
-        // Render at device pixel ratio for crisp text, but size the element in CSS pixels
-        // so the zoom level actually changes the on-screen size.
-        const dpr = window.devicePixelRatio || 1;
-        const fitScale = containerWidth / page.getViewport({ scale: 1 }).width;
-        const viewport = page.getViewport({ scale: fitScale * zoom * dpr });
-        const canvas = pdfCanvasRef.current;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return;
+      // Resize and draw synchronously in the same turn so the browser never composites a blank white frame.
+      if (canvas.width !== entry.pixelWidth) canvas.width = entry.pixelWidth;
+      if (canvas.height !== entry.pixelHeight) canvas.height = entry.pixelHeight;
+      ctx.drawImage(entry.image, 0, 0, entry.pixelWidth, entry.pixelHeight);
+      canvas.style.width = `${entry.cssWidth}px`;
+      canvas.style.height = `${entry.cssHeight}px`;
 
-        canvas.width = Math.floor(viewport.width);
-        canvas.height = Math.floor(viewport.height);
-        canvas.style.width = `${Math.floor(viewport.width / dpr)}px`;
-        canvas.style.height = `${Math.floor(viewport.height / dpr)}px`;
-        renderTask = page.render({ canvas, canvasContext: ctx, viewport });
-        renderTask.promise
-          .then(() => {
-            if (cancelled) return;
-            if (scrollContainerRef.current && pendingScrollTopRef.current !== null) {
-              scrollContainerRef.current.scrollTop = pendingScrollTopRef.current;
-              pendingScrollTopRef.current = null;
+      lastPaintedSizeRef.current = {
+        cssWidth: entry.cssWidth,
+        cssHeight: entry.cssHeight,
+        zoom: targetZoom,
+      };
+      setPdfCanvasReady(true);
+      setPdfPageRendering(false);
+
+      if (scrollContainerRef.current && pendingScrollTopRef.current !== null) {
+        scrollContainerRef.current.scrollTop = pendingScrollTopRef.current;
+        pendingScrollTopRef.current = null;
+      }
+    }, []);
+
+    const renderPdfPageToCache = useCallback(
+      async (
+        doc: pdfjsLib.PDFDocumentProxy,
+        pageNumber: number,
+        containerW: number,
+        targetZoom: number,
+        dpr: number,
+        onTask: (task: pdfjsLib.RenderTask | null) => void,
+      ): Promise<PdfCachedPage | null> => {
+        if (pdfDocRef.current !== doc) return null;
+        let page = pdfPagesRef.current.get(pageNumber);
+        if (!page) {
+          page = await doc.getPage(pageNumber);
+          if (pdfDocRef.current !== doc) {
+            try {
+              page.cleanup();
+            } catch {
+              // ignore
             }
-          })
-          .catch(() => {
-            // cancelled render
-          });
-      });
+            return null;
+          }
+          pdfPagesRef.current.set(pageNumber, page);
+        }
+
+        const baseViewport = page.getViewport({ scale: 1 });
+        const metrics = computePdfRenderMetrics(
+          baseViewport.width,
+          baseViewport.height,
+          containerW,
+          targetZoom,
+          dpr,
+        );
+        const viewport = page.getViewport({ scale: metrics.renderScale });
+
+        const offscreen = document.createElement('canvas');
+        offscreen.width = metrics.pixelWidth;
+        offscreen.height = metrics.pixelHeight;
+        const ctx = offscreen.getContext('2d', { alpha: false }) ?? offscreen.getContext('2d');
+        if (!ctx) {
+          offscreen.width = 0;
+          offscreen.height = 0;
+          return null;
+        }
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, offscreen.width, offscreen.height);
+
+        const renderTask = page.render({
+          canvas: offscreen,
+          canvasContext: ctx,
+          viewport,
+          background: 'rgb(255, 255, 255)',
+        });
+        onTask(renderTask);
+
+        try {
+          await renderTask.promise;
+        } catch (err) {
+          offscreen.width = 0;
+          offscreen.height = 0;
+          throw err;
+        } finally {
+          onTask(null);
+        }
+
+        if (pdfDocRef.current !== doc) {
+          offscreen.width = 0;
+          offscreen.height = 0;
+          return null;
+        }
+
+        let cachedImage: ImageBitmap | HTMLCanvasElement = offscreen;
+        if (typeof window.createImageBitmap === 'function') {
+          try {
+            const bitmap = await window.createImageBitmap(offscreen);
+            offscreen.width = 0;
+            offscreen.height = 0;
+            if (pdfDocRef.current !== doc) {
+              bitmap.close();
+              return null;
+            }
+            cachedImage = bitmap;
+          } catch {
+            // Fall back to keeping the offscreen canvas directly
+          }
+        }
+
+        pdfPageCacheRef.current.set({
+          pageNum: pageNumber,
+          scaleKey: metrics.scaleKey,
+          image: cachedImage,
+          pixelWidth: metrics.pixelWidth,
+          pixelHeight: metrics.pixelHeight,
+          cssWidth: metrics.cssWidth,
+          cssHeight: metrics.cssHeight,
+        });
+        return pdfPageCacheRef.current.get(pageNumber, metrics.scaleKey) ?? null;
+      },
+      [],
+    );
+
+    const schedulePrefetch = useCallback(
+      (
+        doc: pdfjsLib.PDFDocumentProxy,
+        centerPage: number,
+        containerW: number,
+        targetZoom: number,
+        dpr: number,
+      ) => {
+        if (!isActiveRef.current || pdfDocRef.current !== doc || doc.numPages <= 1 || containerW <= 0) {
+          return;
+        }
+        cancelPrefetch();
+        const runId = prefetchRunIdRef.current;
+        const scaleKey = buildPdfScaleKey(containerW, targetZoom, dpr);
+        const targets = getPrefetchTargets(centerPage, doc.numPages, navDirectionRef.current);
+        if (targets.length === 0) return;
+
+        prefetchTimerRef.current = window.setTimeout(() => {
+          prefetchTimerRef.current = null;
+          void (async () => {
+            for (const targetPage of targets) {
+              if (
+                prefetchRunIdRef.current !== runId ||
+                pdfDocRef.current !== doc ||
+                !isActiveRef.current
+              ) {
+                return;
+              }
+              if (pdfPageCacheRef.current.has(targetPage, scaleKey)) continue;
+              try {
+                await renderPdfPageToCache(doc, targetPage, containerW, targetZoom, dpr, (task) => {
+                  prefetchRenderTaskRef.current = task;
+                });
+              } catch {
+                // Cancelled or non-fatal prefetch failure
+                return;
+              }
+            }
+            if (prefetchRunIdRef.current === runId && pdfDocRef.current === doc) {
+              cleanupDistantPdfPages(centerPage);
+            }
+          })();
+        }, PDF_PREFETCH_DELAY_MS);
+      },
+      [cancelPrefetch, renderPdfPageToCache, cleanupDistantPdfPages],
+    );
+
+    // Smooth CSS pre-scaling while continuous Ctrl+wheel zoom settles before crisp re-render
+    useEffect(() => {
+      if (resource.category !== 'pdf' || zoom === renderZoom) return;
+      const canvas = pdfCanvasRef.current;
+      const painted = lastPaintedSizeRef.current;
+      if (!canvas || !painted || painted.zoom <= 0) return;
+      const ratio = zoom / painted.zoom;
+      canvas.style.width = `${Math.max(1, Math.floor(painted.cssWidth * ratio))}px`;
+      canvas.style.height = `${Math.max(1, Math.floor(painted.cssHeight * ratio))}px`;
+    }, [resource.category, zoom, renderZoom]);
+
+    // Render active PDF page via bounded LRU cache + double-buffered offscreen canvas (zero white flash)
+    useEffect(() => {
+      if (loading || !pdfDoc || !pdfCanvasRef.current || containerWidth <= 0) return;
+      const safePage = Math.min(Math.max(1, pageNum), pdfDoc.numPages);
+      if (safePage > lastPageNumRef.current) navDirectionRef.current = 1;
+      else if (safePage < lastPageNumRef.current) navDirectionRef.current = -1;
+      lastPageNumRef.current = safePage;
+
+      const dpr = window.devicePixelRatio || 1;
+      const scaleKey = buildPdfScaleKey(containerWidth, renderZoom, dpr);
+
+      cancelPrefetch();
+      pdfPageCacheRef.current.invalidateOtherScales(scaleKey);
+
+      const cached = pdfPageCacheRef.current.get(safePage, scaleKey);
+      if (cached) {
+        paintCachedPage(cached, renderZoom);
+        cleanupDistantPdfPages(safePage);
+        schedulePrefetch(pdfDoc, safePage, containerWidth, renderZoom, dpr);
+        return () => {
+          cancelPrefetch();
+        };
+      }
+
+      let cancelled = false;
+      const badgeTimer = window.setTimeout(() => {
+        if (!cancelled) setPdfPageRendering(true);
+      }, PDF_RENDER_BADGE_DELAY_MS);
+
+      void renderPdfPageToCache(pdfDoc, safePage, containerWidth, renderZoom, dpr, (task) => {
+        activeRenderTaskRef.current = task;
+      })
+        .then((entry) => {
+          window.clearTimeout(badgeTimer);
+          if (cancelled || !entry) return;
+          paintCachedPage(entry, renderZoom);
+          cleanupDistantPdfPages(safePage);
+          schedulePrefetch(pdfDoc, safePage, containerWidth, renderZoom, dpr);
+        })
+        .catch(() => {
+          window.clearTimeout(badgeTimer);
+          if (!cancelled) setPdfPageRendering(false);
+        });
 
       return () => {
         cancelled = true;
-        renderTask?.cancel();
+        window.clearTimeout(badgeTimer);
+        safeCancelRender(activeRenderTaskRef.current);
+        activeRenderTaskRef.current = null;
+        cancelPrefetch();
       };
-    }, [pdfDoc, pageNum, zoom, containerWidth]);
+    }, [
+      loading,
+      pdfDoc,
+      pageNum,
+      renderZoom,
+      containerWidth,
+      cancelPrefetch,
+      paintCachedPage,
+      renderPdfPageToCache,
+      cleanupDistantPdfPages,
+      schedulePrefetch,
+    ]);
+
+    // When switching away from the resource tab, drop neighbor bitmaps; re-warm when returning
+    useEffect(() => {
+      if (resource.category !== 'pdf' || !pdfDoc) return;
+      const safePage = Math.min(Math.max(1, pageNum), pdfDoc.numPages);
+      if (!isActive) {
+        cancelPrefetch();
+        pdfPageCacheRef.current.pruneKeeping(new Set([safePage]));
+        cleanupDistantPdfPages(safePage);
+        return;
+      }
+      if (containerWidth > 0) {
+        schedulePrefetch(pdfDoc, safePage, containerWidth, renderZoom, window.devicePixelRatio || 1);
+      }
+    }, [
+      isActive,
+      resource.category,
+      pdfDoc,
+      pageNum,
+      renderZoom,
+      containerWidth,
+      cancelPrefetch,
+      cleanupDistantPdfPages,
+      schedulePrefetch,
+    ]);
 
     const getDocPages = useCallback((): HTMLElement[] => {
       const el = scrollContainerRef.current;
@@ -435,11 +846,31 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
      * in place, so zooming in doesn't throw you back to the top-left corner.
      */
     const applyZoom = useCallback(
-      (target: number, anchor?: { clientX: number; clientY: number }) => {
+      (
+        target: number,
+        anchor?: { clientX: number; clientY: number },
+        opts?: { debounceRender?: boolean },
+      ) => {
         const next = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Number(target.toFixed(2))));
+        const commitRenderZoom = () => {
+          if (renderZoomTimerRef.current !== null) {
+            window.clearTimeout(renderZoomTimerRef.current);
+            renderZoomTimerRef.current = null;
+          }
+          if (opts?.debounceRender) {
+            renderZoomTimerRef.current = window.setTimeout(() => {
+              renderZoomTimerRef.current = null;
+              setRenderZoom((prev) => (prev === next ? prev : next));
+            }, PDF_WHEEL_RENDER_DEBOUNCE_MS);
+          } else {
+            setRenderZoom((prev) => (prev === next ? prev : next));
+          }
+        };
+
         const el = scrollContainerRef.current;
         if (!el) {
           setZoom(next);
+          commitRenderZoom();
           return;
         }
         const rect = el.getBoundingClientRect();
@@ -450,10 +881,18 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
         const fx = (el.scrollLeft + px) / Math.max(1, sw);
         const fy = (el.scrollTop + py) / Math.max(1, sh);
         setZoom((prev) => (prev === next ? prev : next));
+        commitRenderZoom();
+
+        // Cancel any previous zoom-anchor loop before starting a new one
+        if (zoomAnchorRafRef.current !== null) {
+          window.cancelAnimationFrame(zoomAnchorRafRef.current);
+          zoomAnchorRafRef.current = null;
+        }
 
         // Content re-renders asynchronously (PDF canvas); re-anchor once its size changes.
         let frames = 0;
         const tick = () => {
+          zoomAnchorRafRef.current = null;
           const node = scrollContainerRef.current;
           if (!node) return;
           if (node.scrollWidth !== sw || node.scrollHeight !== sh) {
@@ -461,9 +900,11 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
             node.scrollTop = fy * node.scrollHeight - py;
             return;
           }
-          if (++frames < 90) window.requestAnimationFrame(tick);
+          if (++frames < 30) {
+            zoomAnchorRafRef.current = window.requestAnimationFrame(tick);
+          }
         };
-        window.requestAnimationFrame(tick);
+        zoomAnchorRafRef.current = window.requestAnimationFrame(tick);
       },
       [],
     );
@@ -478,11 +919,15 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
         if (!e.ctrlKey && !e.metaKey) return;
         e.preventDefault();
         const delta = Math.max(-100, Math.min(100, e.deltaY));
-        applyZoom(zoomRef.current * Math.pow(1.0025, -delta), { clientX: e.clientX, clientY: e.clientY });
+        applyZoom(
+          zoomRef.current * Math.pow(1.0025, -delta),
+          { clientX: e.clientX, clientY: e.clientY },
+          { debounceRender: resource.category === 'pdf' },
+        );
       };
       el.addEventListener('wheel', onWheel, { passive: false });
       return () => el.removeEventListener('wheel', onWheel);
-    }, [zoomable, applyZoom]);
+    }, [zoomable, applyZoom, resource.category]);
 
     // Drag-to-pan ("hand") for pages and images; for documents only once zoomed wider than the panel
     const panRef = useRef<{ id: number; x: number; y: number; left: number; top: number } | null>(null);
@@ -494,16 +939,14 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
       const el = scrollContainerRef.current;
       if (!el || typeof ResizeObserver === 'undefined') return;
       const check = () => setOverflowX(el.scrollWidth > el.clientWidth + 2);
-      check();
+      const raf = window.requestAnimationFrame(check);
       const ro = new ResizeObserver(check);
       ro.observe(el);
-      const mo = new MutationObserver(check);
-      mo.observe(el, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'width'] });
       return () => {
+        window.cancelAnimationFrame(raf);
         ro.disconnect();
-        mo.disconnect();
       };
-    }, [resource.id]);
+    }, [resource.id, zoom, pageNum, docPageCount]);
 
     const canPan =
       resource.category === 'pdf' ||
@@ -609,7 +1052,7 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
     }, [isActive, resource.category, numPages, pageNum, siblingNav]);
 
     return (
-      <div className="flex h-full flex-col bg-slate-950">
+      <div className="relative flex h-full flex-col bg-slate-950">
         {/* Toolbar */}
         <div className="flex items-center justify-between gap-3 border-b border-slate-800/90 bg-slate-900/90 px-4 py-2">
           <div className="flex min-w-0 flex-1 items-center gap-2">
@@ -790,7 +1233,7 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
           onScroll={(e) => {
             handleViewerScroll();
             if (loadedResourceIdRef.current !== resource.id) return;
-            saveViewerState(resource.id, {
+            scheduleSaveViewerState(resource.id, {
               pageNum,
               fitZoom: zoom,
               scrollTop: e.currentTarget.scrollTop,
@@ -831,7 +1274,9 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
             <div className="flex w-max min-w-full justify-center">
               <canvas
                 ref={pdfCanvasRef}
-                className="rounded-xl bg-white shadow-2xl ring-1 ring-slate-700"
+                className={`rounded-xl shadow-2xl ring-1 ring-slate-700 ${
+                  pdfCanvasReady ? 'bg-white' : 'opacity-0'
+                }`}
               />
             </div>
           )}
@@ -920,6 +1365,13 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
             />
           )}
         </div>
+
+        {!loading && !error && resource.category === 'pdf' && pdfPageRendering && (
+          <div className="pointer-events-none absolute right-4 bottom-4 z-20 flex items-center gap-1.5 rounded-full border border-slate-700/80 bg-slate-900/90 px-2.5 py-1 text-[11px] text-slate-300 shadow-lg backdrop-blur">
+            <Loader2 className="h-3 w-3 animate-spin text-indigo-400" />
+            <span>Sayfa {pageNum} hazırlanıyor...</span>
+          </div>
+        )}
       </div>
     );
   },

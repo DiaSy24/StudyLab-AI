@@ -101,6 +101,15 @@ describe('code files & linked local resources', () => {
     const body = await request(app).get(res.url).expect(200);
     expect(body.text).toContain('class Main');
 
+    // Supports HTTP Range requests (used by PDF.js streaming/range loading to avoid loading huge PDFs into RAM)
+    const partial = await request(app)
+      .get(res.url)
+      .set('Range', 'bytes=0-11')
+      .expect(206);
+    expect(partial.headers['accept-ranges']).toBe('bytes');
+    expect(partial.headers['content-range']).toMatch(/^bytes 0-11\/\d+$/);
+    expect(partial.text).toBe('public class');
+
     await request(app).delete(`/api/workspaces/${wsId}/resources/${res.id}`).expect(200);
     await expect(fs.readFile(javaPath, 'utf-8')).resolves.toContain('class Main');
   });
