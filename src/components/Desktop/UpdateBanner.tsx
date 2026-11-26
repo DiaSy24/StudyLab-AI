@@ -178,7 +178,7 @@ export const UpdateBanner: React.FC = () => {
   );
 };
 
-export const DesktopVersionButton: React.FC = () => {
+export const DesktopVersionButton: React.FC<{ compact?: boolean }> = ({ compact = false }) => {
   const [version, setVersion] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
 
@@ -204,15 +204,18 @@ export const DesktopVersionButton: React.FC = () => {
     <button
       type="button"
       onClick={() => void handleCheck()}
-      title="Güncellemeleri kontrol et"
-      className="inline-flex items-center gap-1 rounded-md border border-slate-700/80 bg-slate-900 px-2 py-1 text-[10px] font-medium text-slate-300 transition hover:border-indigo-500/60 hover:text-white"
+      title={`v${version} — Güncellemeleri kontrol et`}
+      aria-label={`Sürüm v${version}, güncellemeleri kontrol et`}
+      className={`inline-flex items-center rounded-md border border-slate-700/80 bg-slate-900 text-[10px] font-medium text-slate-300 transition hover:border-indigo-500/60 hover:text-white ${
+        compact ? 'p-1.5' : 'gap-1 px-2 py-1'
+      }`}
     >
       {checking ? (
         <Loader2 className="h-3 w-3 animate-spin text-indigo-400" />
       ) : (
         <Download className="h-3 w-3 text-indigo-400" />
       )}
-      v{version}
+      {!compact && <span>v{version}</span>}
     </button>
   );
 };

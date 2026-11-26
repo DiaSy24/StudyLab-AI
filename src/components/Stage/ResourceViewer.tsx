@@ -5,7 +5,6 @@ import {
   FileText,
   FolderOpen,
   Loader2,
-  Pencil,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
@@ -48,7 +47,6 @@ interface ResourceViewerProps {
   isActive?: boolean;
   /** Declarative page jump request (handles async resource switches and hidden-to-visible tab transitions). */
   requestedJump?: RequestedViewerJump | null;
-  onStartAnnotate: () => void;
   /** Reports the visible page and page count. `pageCount` is 0 when the resource has no pages. */
   onPageChange?: (page: number, pageCount: number) => void;
 }
@@ -118,7 +116,7 @@ function saveViewerState(resourceId: string, state: StoredViewerState): void {
 }
 
 export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerProps>(
-  ({ resource, siblingNav, isActive = true, requestedJump = null, onStartAnnotate, onPageChange }, ref) => {
+  ({ resource, siblingNav, isActive = true, requestedJump = null, onPageChange }, ref) => {
     const pdfCanvasRef = useRef<HTMLCanvasElement>(null);
     const imgRef = useRef<HTMLImageElement>(null);
     const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -1215,15 +1213,6 @@ export const ResourceViewer = forwardRef<ResourceViewerHandle, ResourceViewerPro
                 </button>
               </>
             )}
-
-            <button
-              type="button"
-              onClick={onStartAnnotate}
-              title="Sayfanın üzerini elle işaretle ve sor"
-              className="flex items-center gap-1.5 rounded-lg bg-rose-500/20 px-2.5 py-1.5 text-xs font-semibold text-rose-200 ring-1 ring-rose-500/40 hover:bg-rose-500/30"
-            >
-              <Pencil className="h-3.5 w-3.5" /> İşaretle
-            </button>
           </div>
         </div>
 

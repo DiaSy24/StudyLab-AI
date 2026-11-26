@@ -1386,6 +1386,8 @@ export default function App() {
     attachToActiveQuickTurn(activeWorkspace.id, res.activeSessionId, res.activeTurn);
   };
 
+  const compactStageHeader = leftOpen && rightOpen;
+
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-slate-950 text-slate-100">
       <UpdateBanner />
@@ -1460,8 +1462,12 @@ export default function App() {
       {/* Center Interactive Stage */}
       <main className="relative flex min-w-0 flex-1 flex-col bg-slate-950">
         {/* Stage Tab Bar */}
-        <header className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/90 bg-slate-900/80 px-3 py-2">
-          <div className="flex items-center gap-2">
+        <header
+          className={`flex flex-wrap items-center justify-between border-b border-slate-800/90 bg-slate-900/80 py-2 ${
+            compactStageHeader ? 'gap-1.5 px-2.5' : 'gap-2 px-3'
+          }`}
+        >
+          <div className={`flex items-center ${compactStageHeader ? 'gap-1.5' : 'gap-2'}`}>
             <button
               type="button"
               onClick={() => setLeftOpen((o) => !o)}
@@ -1482,7 +1488,11 @@ export default function App() {
                 setActiveTab('artifact');
                 setAnnotating(false);
               }}
-              className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
+              title="Etkileşimli Sahne"
+              aria-label="Etkileşimli Sahne"
+              className={`flex items-center gap-1.5 rounded-lg text-xs font-semibold transition ${
+                compactStageHeader ? 'p-1.5' : 'px-3 py-1.5'
+              } ${
                 activeTab === 'artifact'
                   ? 'bg-indigo-600 text-white shadow'
                   : 'text-slate-400 hover:text-slate-200'
@@ -1493,7 +1503,7 @@ export default function App() {
               ) : (
                 <Box className="h-3.5 w-3.5" />
               )}
-              Etkileşimli Sahne
+              {!compactStageHeader && <span>Etkileşimli Sahne</span>}
             </button>
 
             <button
@@ -1502,14 +1512,18 @@ export default function App() {
                 setActiveTab('resource');
                 setAnnotating(false);
               }}
-              className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
+              title={`Kaynaklar (${resources.length})`}
+              aria-label={`Kaynaklar (${resources.length})`}
+              className={`flex items-center gap-1.5 rounded-lg text-xs font-semibold transition ${
+                compactStageHeader ? 'p-1.5' : 'px-3 py-1.5'
+              } ${
                 activeTab === 'resource'
                   ? 'bg-indigo-600 text-white shadow'
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
               <FileText className="h-3.5 w-3.5" />
-              Kaynaklar ({resources.length})
+              {!compactStageHeader && <span>Kaynaklar ({resources.length})</span>}
             </button>
 
             <button
@@ -1518,14 +1532,18 @@ export default function App() {
                 setActiveTab('whiteboard');
                 setAnnotating(false);
               }}
-              className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
+              title="Ortak Tahta"
+              aria-label="Ortak Tahta"
+              className={`flex items-center gap-1.5 rounded-lg text-xs font-semibold transition ${
+                compactStageHeader ? 'p-1.5' : 'px-3 py-1.5'
+              } ${
                 activeTab === 'whiteboard'
                   ? 'bg-indigo-600 text-white shadow'
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
               <PenTool className="h-3.5 w-3.5" />
-              Ortak Tahta
+              {!compactStageHeader && <span>Ortak Tahta</span>}
             </button>
 
             <button
@@ -1534,20 +1552,24 @@ export default function App() {
                 setActiveTab('quiz');
                 setAnnotating(false);
               }}
-              className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
+              title="Alıştırma"
+              aria-label="Alıştırma"
+              className={`flex items-center gap-1.5 rounded-lg text-xs font-semibold transition ${
+                compactStageHeader ? 'p-1.5' : 'px-3 py-1.5'
+              } ${
                 activeTab === 'quiz'
                   ? 'bg-indigo-600 text-white shadow'
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
               <HelpCircle className="h-3.5 w-3.5" />
-              Alıştırma
+              {!compactStageHeader && <span>Alıştırma</span>}
             </button>
             </div>
           </div>
 
           <div className="flex items-center gap-1.5">
-            <DesktopVersionButton />
+            <DesktopVersionButton compact={compactStageHeader} />
             {/* Hızlı Chat Controls (left of the icon-only Annotate button) */}
             <div className="flex items-center gap-1 rounded-xl bg-slate-950/90 p-0.5 ring-1 ring-slate-800">
               <button
@@ -1562,7 +1584,9 @@ export default function App() {
                 title={quickChatOpen ? "Hızlı Chat'i gizle" : "Hızlı Chat'i aç"}
                 aria-label="Hızlı Chat"
                 aria-expanded={quickChatOpen}
-                className={`relative flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs font-semibold transition ${
+                className={`relative flex items-center gap-1.5 rounded-lg text-xs font-semibold transition ${
+                  compactStageHeader ? 'p-1' : 'px-2.5 py-1'
+                } ${
                   quickChatOpen
                     ? 'bg-amber-500/25 text-amber-200 ring-1 ring-amber-500/50'
                     : 'text-slate-300 hover:bg-slate-800/80 hover:text-amber-200'
@@ -1573,11 +1597,13 @@ export default function App() {
                 ) : (
                   <Zap className="h-3.5 w-3.5 text-amber-300" />
                 )}
-                <span>Hızlı Chat</span>
+                {!compactStageHeader && <span>Hızlı Chat</span>}
                 {quickHasUnread && !quickChatOpen && (
                   <span
                     aria-label="Yeni yanıt var"
-                    className="h-2 w-2 rounded-full bg-amber-400 shadow-sm shadow-amber-400/60"
+                    className={`h-2 w-2 rounded-full bg-amber-400 shadow-sm shadow-amber-400/60 ${
+                      compactStageHeader ? 'absolute -top-0.5 -right-0.5' : ''
+                    }`}
                   />
                 )}
               </button>
@@ -1664,7 +1690,6 @@ export default function App() {
                 siblingNav={siblingNav}
                 isActive={activeTab === 'resource' && !annotating}
                 requestedJump={requestedJump}
-                onStartAnnotate={() => void handleStartAnnotate()}
                 onPageChange={handleViewerPageChange}
               />
             </div>
